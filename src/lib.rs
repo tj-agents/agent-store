@@ -19,6 +19,9 @@
 //!         worktree: None,
 //!         terminal: None,
 //!         wrapper: None,
+//!         title: None,
+//!         parent: None,
+//!         launch: None,
 //!         started_at: chrono::Utc::now(),
 //!     };
 //!     service::register(&store, registration).await?;
