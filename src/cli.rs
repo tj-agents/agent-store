@@ -36,7 +36,7 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand, Deserialize)]
-#[serde(tag = "command", rename_all = "kebab-case")]
+#[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 enum Command {
     /// Record a session, or re-register a resumed one.
     Register {
@@ -97,7 +97,7 @@ enum Command {
     Items,
     /// Show one session and its links.
     Show { session: String },
-    /// One-time import of the retired Python store (`sessions.db`, schema 4).
+    #[command(hide = true)]
     ImportLegacy {
         #[arg(long)]
         from: PathBuf,
@@ -250,10 +250,14 @@ async fn dispatch(
             wrapper_started_at,
             started_at,
         } => {
-            let terminal = terminal_kind
-                .map(|kind| Terminal::new(&kind, terminal_id.as_deref()))
-                .transpose()
-                .map_err(|e| Failure::new(Code::InvalidInput, &e))?;
+            let terminal = match (terminal_kind, terminal_id) {
+                (Some(kind), id) => Some(
+                    Terminal::new(&kind, id.as_deref())
+                        .map_err(|e| Failure::new(Code::InvalidInput, &e))?,
+                ),
+                (None, None) => None,
+                (None, Some(_)) => return Err(Failure::invalid("terminal_id needs terminal_kind")),
+            };
             let wrapper = match (wrapper_pid, wrapper_started_at) {
                 (Some(pid), Some(started_at)) => Some(Wrapper { pid, started_at }),
                 (None, None) => None,
@@ -265,8 +269,8 @@ async fn dispatch(
             };
             let registration = Registration {
                 handle: handle(&session)?,
-                cwd,
-                worktree,
+                cwd: absolute(cwd, environment)?,
+                worktree: worktree.map(|w| absolute(w, environment)).transpose()?,
                 terminal,
                 wrapper,
                 started_at: started_at.unwrap_or(now),
@@ -344,7 +348,8 @@ async fn dispatch(
         Command::ImportLegacy { from } => {
             let summary = legacy::import(store, &from).await.map_err(|e| {
                 let code = match e {
-                    legacy::ImportError::SchemaVersion { .. }
+                    legacy::ImportError::Missing(_)
+                    | legacy::ImportError::SchemaVersion { .. }
                     | legacy::ImportError::InvalidRow(_) => Code::InvalidInput,
                     legacy::ImportError::Read { .. } | legacy::ImportError::Store(_) => {
                         Code::Storage
@@ -353,12 +358,25 @@ async fn dispatch(
                 Failure::new(code, &e)
             })?;
             Ok(json!({
-                "sessions": summary.sessions,
+                "imported": summary.imported,
+                "already_present": summary.already_present,
+                "incomplete": summary.incomplete,
                 "links": summary.links,
                 "unlinked_references": summary.unlinked_references,
             }))
         }
     }
+}
+
+fn absolute(path: PathBuf, environment: &Environment) -> Result<PathBuf, Failure> {
+    if path.has_root() {
+        return Ok(path);
+    }
+    environment
+        .cwd
+        .as_ref()
+        .map(|cwd| cwd.join(&path))
+        .ok_or_else(|| Failure::invalid(format!("cannot resolve relative path {}", path.display())))
 }
 
 fn handle(text: &str) -> Result<Handle, Failure> {

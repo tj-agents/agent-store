@@ -24,14 +24,14 @@ store in `tj-agents/agent` (`.agents/agent-store/runtime/`).
 
 CLI commands `register`, `link`, `end`, `mark-closing`, `sessions`, `items`, `show`, and the temporary
 `import-legacy`; flags or one JSON request via `--input`; one schema-versioned JSON document on stdout;
-exit codes 0–5 (README). Library: `domain` (references, sessions, `LinkStore` port, service use cases) and
+exit codes 0–5 (README). Every write is load-change-save inside one `BEGIN IMMEDIATE` transaction. Library: `domain` (references, sessions, `LinkStore` port, service use cases) and
 `sqlite::Store`.
 
 ## Release
 
 `release.yml` runs after CI succeeds on a push to `main`. When `Cargo.toml`'s version has no `v<version>`
-release, it builds `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` and publishes both archives with
-SHA-256 files. Consumers pin a release; Renovate's github-releases datasource bumps the pin.
+release, it builds static `x86_64-pc-windows-msvc` (`+crt-static`) and `x86_64-unknown-linux-musl` binaries
+through `build.yml`, which CI also runs on every PR, and publishes both archives with SHA-256 files. Consumers pin a release; Renovate's github-releases datasource bumps the pin.
 
 ## Verification
 

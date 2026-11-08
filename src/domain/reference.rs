@@ -68,6 +68,10 @@ pub enum ParseError {
     Scope(String),
     #[error("id `{0}` must be non-empty text without whitespace")]
     NativeId(String),
+    #[error(
+        "{provider} scopes are `github.com/<owner>/<repo>` or `dev.azure.com/<org>`, not `{scope}`"
+    )]
+    ScopeShape { provider: String, scope: String },
     #[error("{provider} ids are positive integers, not `{id}`")]
     NotNumeric { provider: String, id: String },
     #[error("`{0}` is a bare id, which needs the repository's tracker scope")]
@@ -85,14 +89,28 @@ impl WorkItemRef {
             scope.to_owned()
         };
         let scope = token(&scope).map(Scope).ok_or(ParseError::Scope(scope))?;
-        let native_id = token(native_id)
+        let mut native_id = token(native_id)
             .map(NativeId)
             .ok_or_else(|| ParseError::NativeId(native_id.to_owned()))?;
-        if provider.is_known() && !is_positive_integer(native_id.as_str()) {
-            return Err(ParseError::NotNumeric {
-                provider: provider.as_str().to_owned(),
-                id: native_id.0,
-            });
+        if provider.is_known() {
+            if !is_positive_integer(native_id.as_str()) {
+                return Err(ParseError::NotNumeric {
+                    provider: provider.as_str().to_owned(),
+                    id: native_id.0,
+                });
+            }
+            native_id = NativeId(native_id.0.trim_start_matches('0').to_owned());
+            let segments = scope.as_str().split('/').filter(|s| !s.is_empty()).count();
+            let shaped = match provider.as_str() {
+                Provider::GITHUB => scope.as_str().starts_with("github.com/") && segments == 3,
+                _ => scope.as_str().starts_with("dev.azure.com/") && segments == 2,
+            };
+            if !shaped {
+                return Err(ParseError::ScopeShape {
+                    provider: provider.as_str().to_owned(),
+                    scope: scope.0,
+                });
+            }
         }
         Ok(Self {
             provider,
@@ -162,7 +180,8 @@ impl RepositoryScope {
                 Provider::GITHUB,
                 format!("github.com/{owner}/{}", repo.trim_end_matches(".git")),
             ),
-            ("dev.azure.com", [org, ..]) | ("ssh.dev.azure.com", ["v3", org, ..]) => {
+            ("dev.azure.com", [org, ..])
+            | ("ssh.dev.azure.com" | "vs-ssh.visualstudio.com", ["v3", org, ..]) => {
                 (Provider::AZURE_DEVOPS, format!("dev.azure.com/{org}"))
             }
             (host, _) if host.ends_with(".visualstudio.com") => {
@@ -197,7 +216,7 @@ fn parse_url(text: &str) -> Option<Result<WorkItemRef, ParseError>> {
             &format!("dev.azure.com/{org}"),
             id,
         )),
-        (host, [_project, "_workitems", "edit", id, ..]) if host.ends_with(".visualstudio.com") => {
+        (host, [.., "_workitems", "edit", id]) if host.ends_with(".visualstudio.com") => {
             let org = host.trim_end_matches(".visualstudio.com");
             Some(WorkItemRef::new(
                 Provider::AZURE_DEVOPS,
@@ -296,6 +315,23 @@ mod tests {
     }
 
     #[test]
+    fn known_ids_are_canonical_and_scopes_shaped() {
+        assert_eq!(
+            parsed("github:github.com/a/b:0461"),
+            "github:github.com/a/b:461"
+        );
+        assert!(matches!(
+            WorkItemRef::new("github", "a/b", "461"),
+            Err(ParseError::ScopeShape { .. })
+        ));
+        assert!(WorkItemRef::new("azure-devops", "dev.azure.com/org/project", "1").is_err());
+        assert_eq!(
+            parsed("https://contoso.visualstudio.com/DefaultCollection/Web/_workitems/edit/7"),
+            "azure-devops:dev.azure.com/contoso:7"
+        );
+    }
+
+    #[test]
     fn rejects_unrecognised_text() {
         assert!(matches!(
             WorkItemRef::parse("https://example.com/x", Some(&core())),
@@ -321,6 +357,10 @@ mod tests {
         );
         assert_eq!(
             scope("https://contoso.visualstudio.com/Web/_git/site").as_deref(),
+            Some("dev.azure.com/contoso")
+        );
+        assert_eq!(
+            scope("contoso@vs-ssh.visualstudio.com:v3/contoso/Web/site").as_deref(),
             Some("dev.azure.com/contoso")
         );
         assert_eq!(scope("https://gitlab.com/a/b.git"), None);

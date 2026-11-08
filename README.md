@@ -31,14 +31,16 @@ Download the archive for your platform from the
 cargo install --git https://github.com/tj-agents/agent-store --locked
 ```
 
-Release assets: `agent-store-v<version>-x86_64-pc-windows-msvc.zip` and
-`agent-store-v<version>-x86_64-unknown-linux-gnu.tar.gz`, each with a `.sha256`.
+Release assets are static binaries with no runtime dependencies:
+`agent-store-v<version>-x86_64-pc-windows-msvc.zip` and
+`agent-store-v<version>-x86_64-unknown-linux-musl.tar.gz`, each with a `.sha256`.
 
 ## Database location
 
 In order of precedence: `--database <file>`, the `AGENT_STORE_DATABASE` environment variable, then
-`agent-store/agent-store.db` under the platform data directory (`%APPDATA%` on Windows,
-`$XDG_DATA_HOME` or `~/.local/share` on Linux, `~/Library/Application Support` on macOS). The file and its
+`agent-store/agent-store.db` under the platform's local data directory (`%LOCALAPPDATA%` on Windows,
+`$XDG_DATA_HOME` or `~/.local/share` on Linux, `~/Library/Application Support` on macOS). Rows hold
+machine-specific pids, terminals and paths, so keep the file out of roaming or synced folders. The file and its
 directory are created on first use and the schema is migrated automatically.
 
 ## Work item references
@@ -53,12 +55,13 @@ Anywhere a command takes `--item`, it accepts:
 | `https://acme.visualstudio.com/Web/_workitems/edit/461` | `azure-devops:dev.azure.com/acme:461` |
 | `provider:scope:id`, for example `jira:acme.atlassian.net:APP-12` | as written |
 
-A provider is any lowercase name. `github` and `azure-devops` scopes are lowercased and their ids must be
-positive integers; other providers' scopes and ids are kept as written.
+A provider is any lowercase name. For `github` and `azure-devops` the scope must be
+`github.com/<owner>/<repo>` or `dev.azure.com/<org>` (lowercased) and the id a positive integer, stored
+without leading zeros; other providers' scopes and ids are kept as written.
 
 ## CLI
 
-Every invocation prints exactly one JSON document to stdout:
+Every command prints exactly one JSON document to stdout (`--help` and `--version` print text):
 
 ```json
 {"schema_version": 1, "ok": true, "data": { ... }}
@@ -72,13 +75,13 @@ Every invocation prints exactly one JSON document to stdout:
 | 2 | `invalid-input` | bad arguments, reference, handle or JSON request |
 | 3 | `not-found` | the session is not registered |
 | 4 | `conflict` | the session has already ended |
-| 5 | `storage` | the database cannot be opened, migrated, read or written |
+| 5 | `storage` | the database cannot be opened, migrated, read or written, or holds invalid data |
 
 A session is addressed by its handle, `host:session-id`, for example `claude:0f3c2a…`.
 
 | Command | Result `data` |
 |---|---|
-| `register --session H --cwd DIR [--worktree DIR] [--terminal-kind K [--terminal-id ID]] [--wrapper-pid PID --wrapper-started-at TIME] [--started-at TIME]` | `{session}`. Re-registering a session (a resume) updates where it runs, keeps its links and makes it active again. |
+| `register --session H --cwd DIR [--worktree DIR] [--terminal-kind K [--terminal-id ID]] [--wrapper-pid PID --wrapper-started-at TIME] [--started-at TIME]` | `{session}`. Relative paths resolve against the current directory. Re-registering a session (a resume) updates where it runs and keeps its links; an ended session becomes active again, and a pending close request stays. |
 | `link --session H --item REF [--role owner]` | `{session}`. Linking again changes only the role. |
 | `end --session H [--reason closed]` | `{session}` |
 | `mark-closing --item REF` or `mark-closing --session H` | `{sessions}`: the sessions now `closing`. A wrapper that polls `show` stops its agent when it sees this. |
@@ -102,13 +105,16 @@ Times are RFC 3339, for example `2026-11-08T10:00:00Z`. A session object:
 }
 ```
 
+Writes are atomic: each command reads, changes and saves inside one write transaction, so commands run
+in parallel by several processes never undo each other.
+
 `state` is `active`, `closing` or `ended`. New fields may be added within a schema version; a field is never
 removed or changed in meaning without incrementing `schema_version`.
 
 ### JSON requests
 
 Instead of flags, pass one request object on stdin (or from a file) with `--input`. Field names are the
-flag names in `snake_case`; `command` names the subcommand:
+flag names in `snake_case`; `command` names the subcommand; an unknown field is invalid input:
 
 ```sh
 echo '{"command":"link","session":"codex:019a…","item":"#461","role":"reviewer"}' | agent-store --input -

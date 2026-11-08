@@ -29,7 +29,8 @@ INSERT INTO sessions (handle, host, session_id, cwd, work_item, role, started_at
     ('codex:01a1', 'codex', '01a1', 'C:\repos\core', 'execution:a', 'owner', 1792599225.4595122, NULL, NULL),
     ('claude:c2', 'claude', 'c2', '/repos/cli', 'execution:b', 'bounded: reusable onboarding repair',
         1792881361.0, 1792882481.6538434, 'handed_off'),
-    ('claude:loose', 'claude', 'loose', '/repos/x', NULL, NULL, 1792000000.0, NULL, NULL);
+    ('claude:loose', 'claude', 'loose', '/repos/x', NULL, NULL, 1792000000.0, NULL, NULL),
+    ('claude:nocwd', 'claude', 'nocwd', NULL, NULL, NULL, 1792000000.0, NULL, NULL);
 PRAGMA user_version = 4;
 ";
 
@@ -58,7 +59,9 @@ fn imports_sessions_links_and_end_state() {
     let fixture = Fixture::new();
     let legacy = legacy_database(&fixture, LEGACY_SCHEMA);
     let summary = fixture.ok(&["import-legacy", "--from", &legacy]);
-    assert_eq!(summary["sessions"], 3);
+    assert_eq!(summary["imported"], 3);
+    assert_eq!(summary["already_present"], 0);
+    assert_eq!(summary["incomplete"], 1);
     assert_eq!(summary["links"], 3);
     assert_eq!(summary["unlinked_references"], 1);
 
@@ -80,8 +83,40 @@ fn imports_sessions_links_and_end_state() {
     );
 
     let rerun = fixture.ok(&["import-legacy", "--from", &legacy]);
-    assert_eq!(rerun["sessions"], 3);
+    assert_eq!(rerun["imported"], 0);
+    assert_eq!(rerun["already_present"], 3);
     assert_eq!(fixture.ok(&["items"])["items"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn never_overwrites_a_registered_session() {
+    let fixture = Fixture::new();
+    fixture.ok(&[
+        "register",
+        "--session",
+        "codex:01a1",
+        "--cwd",
+        "/new",
+        "--terminal-kind",
+        "tmux",
+        "--terminal-id",
+        "%1",
+    ]);
+    let legacy = legacy_database(&fixture, LEGACY_SCHEMA);
+    let summary = fixture.ok(&["import-legacy", "--from", &legacy]);
+    assert_eq!(summary["imported"], 2);
+    assert_eq!(summary["already_present"], 1);
+    let kept = fixture.ok(&["show", "codex:01a1"])["session"].clone();
+    assert_eq!(kept["cwd"], "/new");
+    assert_eq!(kept["terminal"]["id"], "%1");
+}
+
+#[test]
+fn a_missing_legacy_file_is_invalid_input() {
+    let fixture = Fixture::new();
+    let missing = fixture.path("absent.db");
+    let run = fixture.run(&["import-legacy", "--from", missing.to_str().unwrap()]);
+    assert_eq!(run.code, 2, "{}", run.json);
 }
 
 #[test]

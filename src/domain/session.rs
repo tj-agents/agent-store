@@ -202,13 +202,16 @@ impl Session {
         }
     }
 
-    /// A resumed session re-registers: its location and process change, its links stay, and it is active again.
+    /// A resumed session re-registers: its location and process change and its links stay. An ended
+    /// session becomes active again; a pending close request survives.
     pub fn resume(&mut self, registration: Registration) {
         self.cwd = registration.cwd;
         self.worktree = registration.worktree;
         self.terminal = registration.terminal;
         self.wrapper = registration.wrapper;
-        self.state = State::Active;
+        if let State::Ended { .. } = self.state {
+            self.state = State::Active;
+        }
     }
 
     pub fn link(&mut self, item: WorkItemRef, role: Role, now: DateTime<Utc>) {
@@ -267,6 +270,10 @@ impl Session {
 
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    pub fn is_closing(&self) -> bool {
+        matches!(self.state, State::Closing { .. })
     }
 
     pub fn links(&self) -> &[Link] {
@@ -351,5 +358,18 @@ mod tests {
         assert_eq!(session.state(), &State::Active);
         assert_eq!(session.cwd(), &PathBuf::from("/b"));
         assert_eq!(session.links().len(), 1);
+    }
+
+    #[test]
+    fn resume_keeps_a_pending_close_request() {
+        let mut session = Session::register(registration("/a"));
+        session.request_close(at(1)).unwrap();
+        session.resume(registration("/a"));
+        assert_eq!(
+            session.state(),
+            &State::Closing {
+                requested_at: at(1)
+            }
+        );
     }
 }

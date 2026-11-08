@@ -46,42 +46,10 @@ jobs:
   build:
     needs: qualify
     if: needs.qualify.outputs.version != ''
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    env:
-      ARCHIVE: agent-store-v${{ needs.qualify.outputs.version }}-${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.qualify.outputs.sha }}
-          persist-credentials: false
-      - run: rustup toolchain install
-      - run: cargo build --release --locked
-      - name: package (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          tar -czf "$ARCHIVE.tar.gz" -C target/release agent-store
-          sha256sum "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
-      - name: package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path target/release/agent-store.exe -DestinationPath "$env:ARCHIVE.zip"
-          $hash = (Get-FileHash "$env:ARCHIVE.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $env:ARCHIVE.zip" | Out-File -Encoding ascii -NoNewline "$env:ARCHIVE.zip.sha256"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: ${{ env.ARCHIVE }}
-          path: ${{ env.ARCHIVE }}.*
-          if-no-files-found: error
-          retention-days: 7
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.qualify.outputs.sha }}
+      version: ${{ needs.qualify.outputs.version }}
 
   publish:
     needs: [qualify, build]
@@ -101,4 +69,4 @@ jobs:
           set -euo pipefail
           gh release create "v$VERSION" agent-store-v"$VERSION"-* \
             --repo "$REPOSITORY" --target "$SHA" --title "v$VERSION" \
-            --notes "agent-store $VERSION for Windows (x86_64-pc-windows-msvc) and Linux (x86_64-unknown-linux-gnu)."
+            --notes "agent-store $VERSION: static binaries for Windows (x86_64-pc-windows-msvc) and Linux (x86_64-unknown-linux-musl)."
