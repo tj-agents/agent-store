@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.qualify.outputs.sha }}
+      version: ${{ steps.qualify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - id: qualify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "agent-store") | .version')"
+          if gh release view "v$version" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo "v$version is already released"
+            exit 0
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: qualify
+    if: needs.qualify.outputs.version != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      ARCHIVE: agent-store-v${{ needs.qualify.outputs.version }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.qualify.outputs.sha }}
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo build --release --locked
+      - name: package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          tar -czf "$ARCHIVE.tar.gz" -C target/release agent-store
+          sha256sum "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
+      - name: package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/agent-store.exe -DestinationPath "$env:ARCHIVE.zip"
+          $hash = (Get-FileHash "$env:ARCHIVE.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:ARCHIVE.zip" | Out-File -Encoding ascii -NoNewline "$env:ARCHIVE.zip.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}.*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [qualify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ needs.qualify.outputs.sha }}
+          VERSION: ${{ needs.qualify.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" agent-store-v"$VERSION"-* \
+            --repo "$REPOSITORY" --target "$SHA" --title "v$VERSION" \
+            --notes "agent-store $VERSION for Windows (x86_64-pc-windows-msvc) and Linux (x86_64-unknown-linux-gnu)."
