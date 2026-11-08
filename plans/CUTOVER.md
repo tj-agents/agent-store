@@ -8,7 +8,7 @@ caller, imports once and deletes the Python store and the import command.
 ## Preconditions
 
 - `agent-store` has a published release (Windows and Linux archives).
-- tj-agents/rust#31 merged and `rust-seaorm` is in the marketplace roster.
+- `seaorm` (tj-agents/rust#33) is in the marketplace roster.
 
 ## Steps
 
