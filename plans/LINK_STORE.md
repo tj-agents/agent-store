@@ -5,7 +5,7 @@ store in `tj-agents/agent` (`.agents/agent-store/runtime/`).
 
 ## Decisions
 
-- SQLite through SeaORM (`rust-seaorm` standard, tj-agents/rust#31). SeaORM over Diesel for entities,
+- SQLite through SeaORM (`seaorm` standard, tj-agents/rust#32 and #33). SeaORM over Diesel for entities,
   ActiveModel and `sea-orm-migration` run at startup; Diesel is synchronous and DSL-first.
 - Links only. No tracker status or kinds, no turn state, no liveness: callers read liveness from the hosts.
 - Open-ended providers, hosts and roles (lowercase names); `github` and `azure-devops` get URL parsing and
