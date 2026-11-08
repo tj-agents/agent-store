@@ -5,15 +5,19 @@ use std::process::ExitCode;
 
 use chrono::{DateTime, Utc};
 use clap::error::ErrorKind;
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::domain::reference::{self, RepositoryScope, WorkItemRef};
 use crate::domain::session::ports::{Item, StoreError};
-use crate::domain::session::service::{self, EndError, LinkError, ShowError};
+use crate::domain::session::service::{
+    self, EndError, LaunchError, LaunchStateError, LinkError, RegisterError, ShowError,
+    ShowLaunchError,
+};
 use crate::domain::session::{
-    EndReason, Handle, Registration, Role, Session, State, Terminal, Wrapper,
+    EndReason, Handle, Host, Launch, LaunchId, Registration, Role, Session, State, Terminal, Title,
+    Wrapper,
 };
 use crate::git;
 use crate::sqlite::{Store, legacy};
@@ -38,6 +42,37 @@ struct Cli {
 #[derive(Debug, Subcommand, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 enum Command {
+    /// Record a tab launched for an agent before the agent's host session exists.
+    Launch {
+        /// An id the launcher chose, passed on to the session's `register --launch-id`.
+        #[arg(long)]
+        launch_id: String,
+        /// The host that will run the session, for example `claude`.
+        #[arg(long)]
+        host: String,
+        /// The tab title, by which the session is addressed.
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        worktree: Option<PathBuf>,
+        /// The work item the session is linked to, as owner, when it registers.
+        #[arg(long)]
+        item: Option<String>,
+        #[arg(long)]
+        terminal_kind: Option<String>,
+        #[arg(long, requires = "terminal_kind")]
+        terminal_id: Option<String>,
+        /// Pid of the process that owns the tab.
+        #[arg(long)]
+        wrapper_pid: u32,
+        #[arg(long)]
+        wrapper_started_at: DateTime<Utc>,
+        /// The session that started this one, as `host:session-id`.
+        #[arg(long)]
+        parent: Option<String>,
+    },
     /// Record a session, or re-register a resumed one.
     Register {
         /// `host:session-id`, for example `claude:0f3c…`.
@@ -58,6 +93,14 @@ enum Command {
         wrapper_pid: Option<u32>,
         #[arg(long, requires = "wrapper_pid")]
         wrapper_started_at: Option<DateTime<Utc>>,
+        /// Bind to this launch, inheriting what these arguments leave unset and linking its work item.
+        #[arg(long)]
+        launch_id: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// The session that started this one, as `host:session-id`.
+        #[arg(long)]
+        parent: Option<String>,
         /// Defaults to now.
         #[arg(long)]
         started_at: Option<DateTime<Utc>>,
@@ -75,28 +118,51 @@ enum Command {
     },
     /// Record that a session ended.
     End {
+        #[arg(
+            long,
+            required_unless_present = "launch_id",
+            conflicts_with = "launch_id"
+        )]
+        session: Option<String>,
+        /// Record that a launch's wrapper finished, instead of a session.
         #[arg(long)]
-        session: String,
+        launch_id: Option<String>,
         #[arg(long, default_value = "closed")]
         #[serde(default = "closed")]
         reason: String,
     },
-    /// Ask the wrapper of a session, or of every open session of a work item, to close it.
+    /// Ask the wrapper of a session or launch, or of every open session and launch of a work item, to
+    /// close it.
+    #[command(group(ArgGroup::new("target").required(true).args(["item", "session", "launch_id"])))]
     MarkClosing {
-        #[arg(long, required_unless_present = "session", conflicts_with = "session")]
+        #[arg(long)]
         item: Option<String>,
         #[arg(long)]
         session: Option<String>,
-    },
-    /// List the sessions linked to a work item.
-    Sessions {
         #[arg(long)]
-        item: String,
+        launch_id: Option<String>,
+    },
+    /// List every launch, or every launch for a work item, oldest first.
+    Launches {
+        #[arg(long)]
+        item: Option<String>,
+    },
+    /// List the sessions linked to a work item, or titled `--title`.
+    Sessions {
+        #[arg(long, required_unless_present = "title", conflicts_with = "title")]
+        item: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
     },
     /// List every work item that has linked sessions.
     Items,
-    /// Show one session and its links.
-    Show { session: String },
+    /// Show one session and its links, or a launch and the session bound to it.
+    Show {
+        #[arg(required_unless_present = "launch_id", conflicts_with = "launch_id")]
+        session: Option<String>,
+        #[arg(long)]
+        launch_id: Option<String>,
+    },
     #[command(hide = true)]
     ImportLegacy {
         #[arg(long)]
@@ -240,6 +306,42 @@ async fn dispatch(
 ) -> Result<Value, Failure> {
     let now = environment.now;
     match command {
+        Command::Launch {
+            launch_id,
+            host,
+            title,
+            cwd,
+            worktree,
+            item,
+            terminal_kind,
+            terminal_id,
+            wrapper_pid,
+            wrapper_started_at,
+            parent,
+        } => {
+            let launch = Launch {
+                id: parse_launch_id(&launch_id)?,
+                host: Host::parse(&host).map_err(|e| Failure::new(Code::InvalidInput, &e))?,
+                title: parse_title(&title)?,
+                cwd: absolute(cwd, environment)?,
+                worktree: worktree.map(|w| absolute(w, environment)).transpose()?,
+                terminal: terminal(terminal_kind, terminal_id)?,
+                wrapper: Wrapper {
+                    pid: wrapper_pid,
+                    started_at: wrapper_started_at,
+                },
+                item: item.map(|i| resolve_item(&i, environment)).transpose()?,
+                parent: parent.as_deref().map(handle).transpose()?,
+                created_at: now,
+                session: None,
+                state: State::Active,
+            };
+            let launch = service::launch(store, launch).await.map_err(|e| match e {
+                LaunchError::Exists(e) => Failure::new(Code::Conflict, &e),
+                LaunchError::Store(e) => storage(&e),
+            })?;
+            Ok(json!({ "launch": LaunchView::from(&launch) }))
+        }
         Command::Register {
             session,
             cwd,
@@ -248,16 +350,11 @@ async fn dispatch(
             terminal_id,
             wrapper_pid,
             wrapper_started_at,
+            launch_id,
+            title,
+            parent,
             started_at,
         } => {
-            let terminal = match (terminal_kind, terminal_id) {
-                (Some(kind), id) => Some(
-                    Terminal::new(&kind, id.as_deref())
-                        .map_err(|e| Failure::new(Code::InvalidInput, &e))?,
-                ),
-                (None, None) => None,
-                (None, Some(_)) => return Err(Failure::invalid("terminal_id needs terminal_kind")),
-            };
             let wrapper = match (wrapper_pid, wrapper_started_at) {
                 (Some(pid), Some(started_at)) => Some(Wrapper { pid, started_at }),
                 (None, None) => None,
@@ -271,13 +368,30 @@ async fn dispatch(
                 handle: handle(&session)?,
                 cwd: absolute(cwd, environment)?,
                 worktree: worktree.map(|w| absolute(w, environment)).transpose()?,
-                terminal,
+                terminal: terminal(terminal_kind, terminal_id)?,
                 wrapper,
+                title: title.as_deref().map(parse_title).transpose()?,
+                parent: parent.as_deref().map(handle).transpose()?,
+                launch: None,
                 started_at: started_at.unwrap_or(now),
             };
-            let session = service::register(store, registration)
+            let session = match launch_id {
+                Some(launch_id) => service::register_launched(
+                    store,
+                    registration,
+                    &parse_launch_id(&launch_id)?,
+                    now,
+                )
                 .await
-                .map_err(|e| storage(&e))?;
+                .map_err(|e| match e {
+                    RegisterError::UnknownLaunch(e) => Failure::new(Code::NotFound, &e),
+                    RegisterError::HostMismatch { .. } => Failure::new(Code::InvalidInput, &e),
+                    RegisterError::Store(e) => storage(&e),
+                })?,
+                None => service::register(store, registration)
+                    .await
+                    .map_err(|e| storage(&e))?,
+            };
             Ok(json!({ "session": SessionView::from(&session) }))
         }
         Command::Link {
@@ -295,56 +409,125 @@ async fn dispatch(
                 })?;
             Ok(json!({ "session": SessionView::from(&session) }))
         }
-        Command::End { session, reason } => {
+        Command::End {
+            session,
+            launch_id,
+            reason,
+        } => {
             let reason =
                 EndReason::parse(&reason).map_err(|e| Failure::new(Code::InvalidInput, &e))?;
-            let session = service::end(store, &handle(&session)?, reason, now)
-                .await
-                .map_err(end_failure)?;
-            Ok(json!({ "session": SessionView::from(&session) }))
+            match (session, launch_id) {
+                (Some(session), None) => {
+                    let session = service::end(store, &handle(&session)?, reason, now)
+                        .await
+                        .map_err(end_failure)?;
+                    Ok(json!({ "session": SessionView::from(&session) }))
+                }
+                (None, Some(launch_id)) => {
+                    let launch =
+                        service::end_launch(store, &parse_launch_id(&launch_id)?, reason, now)
+                            .await
+                            .map_err(launch_state_failure)?;
+                    Ok(json!({ "launch": LaunchView::from(&launch) }))
+                }
+                _ => Err(Failure::invalid("pass exactly one of session or launch_id")),
+            }
         }
-        Command::MarkClosing { item, session } => {
-            let sessions = match (item, session) {
-                (Some(item), None) => {
+        Command::Launches { item } => {
+            let item = item.map(|i| resolve_item(&i, environment)).transpose()?;
+            let launches = service::launches(store, item.as_ref())
+                .await
+                .map_err(|e| storage(&e))?;
+            Ok(json!({ "launches": launches.iter().map(LaunchView::from).collect::<Vec<_>>() }))
+        }
+        Command::MarkClosing {
+            item,
+            session,
+            launch_id,
+        } => {
+            let (sessions, launches) = match (item, session, launch_id) {
+                (Some(item), None, None) => {
                     let item = resolve_item(&item, environment)?;
                     service::mark_item_closing(store, &item, now)
                         .await
                         .map_err(|e| storage(&e))?
                 }
-                (None, Some(session)) => {
-                    vec![
-                        service::mark_session_closing(store, &handle(&session)?, now)
-                            .await
-                            .map_err(end_failure)?,
-                    ]
+                (None, Some(session), None) => {
+                    let session = service::mark_session_closing(store, &handle(&session)?, now)
+                        .await
+                        .map_err(end_failure)?;
+                    (vec![session], Vec::new())
                 }
-                _ => return Err(Failure::invalid("pass exactly one of item or session")),
+                (None, None, Some(launch_id)) => {
+                    let launch =
+                        service::mark_launch_closing(store, &parse_launch_id(&launch_id)?, now)
+                            .await
+                            .map_err(launch_state_failure)?;
+                    (Vec::new(), vec![launch])
+                }
+                _ => {
+                    return Err(Failure::invalid(
+                        "pass exactly one of item, session or launch_id",
+                    ));
+                }
             };
-            Ok(json!({ "sessions": sessions.iter().map(SessionView::from).collect::<Vec<_>>() }))
-        }
-        Command::Sessions { item } => {
-            let item = resolve_item(&item, environment)?;
-            let sessions = service::sessions(store, &item)
-                .await
-                .map_err(|e| storage(&e))?;
             Ok(json!({
-                "item": ReferenceView::from(&item),
                 "sessions": sessions.iter().map(SessionView::from).collect::<Vec<_>>(),
+                "launches": launches.iter().map(LaunchView::from).collect::<Vec<_>>(),
             }))
         }
+        Command::Sessions { item, title } => match (item, title) {
+            (Some(item), None) => {
+                let item = resolve_item(&item, environment)?;
+                let sessions = service::sessions(store, &item)
+                    .await
+                    .map_err(|e| storage(&e))?;
+                Ok(json!({
+                    "item": ReferenceView::from(&item),
+                    "sessions": sessions.iter().map(SessionView::from).collect::<Vec<_>>(),
+                }))
+            }
+            (None, Some(title)) => {
+                let title = parse_title(&title)?;
+                let sessions = service::titled(store, &title)
+                    .await
+                    .map_err(|e| storage(&e))?;
+                Ok(json!({
+                    "title": title.as_str(),
+                    "sessions": sessions.iter().map(SessionView::from).collect::<Vec<_>>(),
+                }))
+            }
+            _ => Err(Failure::invalid("pass exactly one of item or title")),
+        },
         Command::Items => {
             let items = service::items(store).await.map_err(|e| storage(&e))?;
             Ok(json!({ "items": items.iter().map(ItemView::from).collect::<Vec<_>>() }))
         }
-        Command::Show { session } => {
-            let session = service::show(store, &handle(&session)?)
-                .await
-                .map_err(|e| match e {
-                    ShowError::NotRegistered(e) => Failure::new(Code::NotFound, &e),
-                    ShowError::Store(e) => storage(&e),
-                })?;
-            Ok(json!({ "session": SessionView::from(&session) }))
-        }
+        Command::Show { session, launch_id } => match (session, launch_id) {
+            (Some(session), None) => {
+                let session =
+                    service::show(store, &handle(&session)?)
+                        .await
+                        .map_err(|e| match e {
+                            ShowError::NotRegistered(e) => Failure::new(Code::NotFound, &e),
+                            ShowError::Store(e) => storage(&e),
+                        })?;
+                Ok(json!({ "session": SessionView::from(&session) }))
+            }
+            (None, Some(launch_id)) => {
+                let (launch, session) = service::show_launch(store, &parse_launch_id(&launch_id)?)
+                    .await
+                    .map_err(|e| match e {
+                        ShowLaunchError::UnknownLaunch(e) => Failure::new(Code::NotFound, &e),
+                        ShowLaunchError::Store(e) => storage(&e),
+                    })?;
+                Ok(json!({
+                    "launch": LaunchView::from(&launch),
+                    "session": session.as_ref().map(SessionView::from),
+                }))
+            }
+            _ => Err(Failure::invalid("pass exactly one of session or launch_id")),
+        },
         Command::ImportLegacy { from } => {
             let summary = legacy::import(store, &from).await.map_err(|e| {
                 let code = match e {
@@ -383,6 +566,24 @@ fn handle(text: &str) -> Result<Handle, Failure> {
     Handle::parse(text).map_err(|e| Failure::new(Code::InvalidInput, &e))
 }
 
+fn parse_title(text: &str) -> Result<Title, Failure> {
+    Title::parse(text).map_err(|e| Failure::new(Code::InvalidInput, &e))
+}
+
+fn parse_launch_id(text: &str) -> Result<LaunchId, Failure> {
+    LaunchId::parse(text).map_err(|e| Failure::new(Code::InvalidInput, &e))
+}
+
+fn terminal(kind: Option<String>, id: Option<String>) -> Result<Option<Terminal>, Failure> {
+    match (kind, id) {
+        (Some(kind), id) => Terminal::new(&kind, id.as_deref())
+            .map(Some)
+            .map_err(|e| Failure::new(Code::InvalidInput, &e)),
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(Failure::invalid("terminal_id needs terminal_kind")),
+    }
+}
+
 fn resolve_item(text: &str, environment: &Environment) -> Result<WorkItemRef, Failure> {
     let parsed = match WorkItemRef::parse(text, None) {
         Err(reference::ParseError::NeedsRepository(_)) => {
@@ -401,6 +602,14 @@ fn resolve_item(text: &str, environment: &Environment) -> Result<WorkItemRef, Fa
         parsed => parsed,
     };
     parsed.map_err(|e| Failure::new(Code::InvalidInput, &e))
+}
+
+fn launch_state_failure(error: LaunchStateError) -> Failure {
+    match error {
+        LaunchStateError::UnknownLaunch(e) => Failure::new(Code::NotFound, &e),
+        LaunchStateError::Ended(e) => Failure::new(Code::Conflict, &e),
+        LaunchStateError::Store(e) => storage(&e),
+    }
 }
 
 fn end_failure(error: EndError) -> Failure {
@@ -468,6 +677,69 @@ struct WrapperView {
     started_at: DateTime<Utc>,
 }
 
+impl From<&Terminal> for TerminalView {
+    fn from(terminal: &Terminal) -> Self {
+        Self {
+            kind: terminal.kind().to_owned(),
+            id: terminal.id().map(str::to_owned),
+        }
+    }
+}
+
+impl From<&Wrapper> for WrapperView {
+    fn from(wrapper: &Wrapper) -> Self {
+        Self {
+            pid: wrapper.pid,
+            started_at: wrapper.started_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LaunchView {
+    launch_id: String,
+    host: String,
+    title: String,
+    cwd: String,
+    worktree: Option<String>,
+    terminal: Option<TerminalView>,
+    wrapper: WrapperView,
+    item: Option<ReferenceView>,
+    parent: Option<String>,
+    created_at: DateTime<Utc>,
+    session: Option<String>,
+    state: &'static str,
+    closing_requested_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
+    end_reason: Option<String>,
+}
+
+impl From<&Launch> for LaunchView {
+    fn from(launch: &Launch) -> Self {
+        let (state, closing_requested_at, ended_at, end_reason) = state_fields(&launch.state);
+        Self {
+            launch_id: launch.id.as_str().to_owned(),
+            host: launch.host.as_str().to_owned(),
+            title: launch.title.as_str().to_owned(),
+            cwd: launch.cwd.to_string_lossy().into_owned(),
+            worktree: launch
+                .worktree
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            terminal: launch.terminal.as_ref().map(TerminalView::from),
+            wrapper: WrapperView::from(&launch.wrapper),
+            item: launch.item.as_ref().map(ReferenceView::from),
+            parent: launch.parent.as_ref().map(ToString::to_string),
+            created_at: launch.created_at,
+            session: launch.session.as_ref().map(ToString::to_string),
+            state,
+            closing_requested_at,
+            ended_at,
+            end_reason,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct LinkView {
     item: ReferenceView,
@@ -484,6 +756,9 @@ struct SessionView {
     worktree: Option<String>,
     terminal: Option<TerminalView>,
     wrapper: Option<WrapperView>,
+    title: Option<String>,
+    parent: Option<String>,
+    launch_id: Option<String>,
     started_at: DateTime<Utc>,
     state: &'static str,
     closing_requested_at: Option<DateTime<Utc>>,
@@ -494,27 +769,18 @@ struct SessionView {
 
 impl From<&Session> for SessionView {
     fn from(session: &Session) -> Self {
-        let (state, closing_requested_at, ended_at, end_reason) = match session.state() {
-            State::Active => ("active", None, None, None),
-            State::Closing { requested_at } => ("closing", Some(*requested_at), None, None),
-            State::Ended { at, reason } => {
-                ("ended", None, Some(*at), Some(reason.as_str().to_owned()))
-            }
-        };
+        let (state, closing_requested_at, ended_at, end_reason) = state_fields(session.state());
         Self {
             session: session.handle().to_string(),
             host: session.handle().host().as_str().to_owned(),
             native_id: session.handle().native_id().to_owned(),
             cwd: session.cwd().to_string_lossy().into_owned(),
             worktree: session.worktree().map(|p| p.to_string_lossy().into_owned()),
-            terminal: session.terminal().map(|t| TerminalView {
-                kind: t.kind().to_owned(),
-                id: t.id().map(str::to_owned),
-            }),
-            wrapper: session.wrapper().map(|w| WrapperView {
-                pid: w.pid,
-                started_at: w.started_at,
-            }),
+            terminal: session.terminal().map(TerminalView::from),
+            wrapper: session.wrapper().as_ref().map(WrapperView::from),
+            title: session.title().map(|t| t.as_str().to_owned()),
+            parent: session.parent().map(ToString::to_string),
+            launch_id: session.launch().map(|l| l.as_str().to_owned()),
             started_at: session.started_at(),
             state,
             closing_requested_at,
@@ -530,6 +796,21 @@ impl From<&Session> for SessionView {
                 })
                 .collect(),
         }
+    }
+}
+
+type StateFields = (
+    &'static str,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<String>,
+);
+
+fn state_fields(state: &State) -> StateFields {
+    match state {
+        State::Active => ("active", None, None, None),
+        State::Closing { requested_at } => ("closing", Some(*requested_at), None, None),
+        State::Ended { at, reason } => ("ended", None, Some(*at), Some(reason.as_str().to_owned())),
     }
 }
 

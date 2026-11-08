@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used)]
 
 mod cli;
+mod launch;
 mod legacy;
 mod store;
 

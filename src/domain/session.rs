@@ -109,6 +109,10 @@ pub struct Role(Slug);
 impl Role {
     pub const OWNER: &str = "owner";
 
+    pub fn owner() -> Self {
+        Self(Slug::parse(Self::OWNER).expect("owner is a valid role"))
+    }
+
     pub fn parse(text: &str) -> Result<Self, slug::ParseError> {
         Slug::parse(text).map(Self)
     }
@@ -132,6 +136,90 @@ impl EndReason {
     }
 }
 
+/// The tab title a launcher gave a session, by which people and other sessions address it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Title(String);
+
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("a title must have visible text")]
+pub struct TitleError;
+
+impl Title {
+    pub fn parse(text: &str) -> Result<Self, TitleError> {
+        if text.trim().is_empty() {
+            Err(TitleError)
+        } else {
+            Ok(Self(text.to_owned()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The id a launcher chose for one tab launch, known before the host assigns a session id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LaunchId(String);
+
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("`{0}` is not a launch id: it must be non-empty with no whitespace")]
+pub struct LaunchIdError(pub String);
+
+impl LaunchId {
+    pub fn parse(text: &str) -> Result<Self, LaunchIdError> {
+        token(text)
+            .map(Self)
+            .ok_or_else(|| LaunchIdError(text.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A tab started for an agent before the agent's host session exists. The session's registration binds
+/// to it and inherits where it runs, its title, parent and work item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    pub id: LaunchId,
+    pub host: Host,
+    pub title: Title,
+    pub cwd: PathBuf,
+    pub worktree: Option<PathBuf>,
+    pub terminal: Option<Terminal>,
+    pub wrapper: Wrapper,
+    pub item: Option<WorkItemRef>,
+    pub parent: Option<Handle>,
+    pub created_at: DateTime<Utc>,
+    /// The session most recently bound to this launch.
+    pub session: Option<Handle>,
+    /// The wrapper's lifecycle: a wrapper stops its agent when its launch or the bound session is closing.
+    pub state: State,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("launch {} has already ended", .0.as_str())]
+pub struct LaunchEnded(pub LaunchId);
+
+impl Launch {
+    pub fn request_close(&mut self, now: DateTime<Utc>) -> Result<(), LaunchEnded> {
+        if self.state.request_close(now) {
+            Ok(())
+        } else {
+            Err(LaunchEnded(self.id.clone()))
+        }
+    }
+
+    pub fn end(&mut self, reason: EndReason, now: DateTime<Utc>) -> Result<(), LaunchEnded> {
+        if self.state.end(reason, now) {
+            Ok(())
+        } else {
+            Err(LaunchEnded(self.id.clone()))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     pub item: WorkItemRef,
@@ -152,6 +240,33 @@ pub enum State {
     },
 }
 
+impl State {
+    /// Moves to closing unless already closing; false when ended.
+    fn request_close(&mut self, now: DateTime<Utc>) -> bool {
+        match self {
+            Self::Active => {
+                *self = Self::Closing { requested_at: now };
+                true
+            }
+            Self::Closing { .. } => true,
+            Self::Ended { .. } => false,
+        }
+    }
+
+    /// Moves to ended; false when already ended.
+    fn end(&mut self, reason: EndReason, now: DateTime<Utc>) -> bool {
+        if let Self::Ended { .. } = self {
+            return false;
+        }
+        *self = Self::Ended { at: now, reason };
+        true
+    }
+
+    pub fn is_closing(&self) -> bool {
+        matches!(self, Self::Closing { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
     pub handle: Handle,
@@ -159,7 +274,26 @@ pub struct Registration {
     pub worktree: Option<PathBuf>,
     pub terminal: Option<Terminal>,
     pub wrapper: Option<Wrapper>,
+    pub title: Option<Title>,
+    pub parent: Option<Handle>,
+    pub launch: Option<LaunchId>,
     pub started_at: DateTime<Utc>,
+}
+
+impl Registration {
+    /// Fills what the registration leaves unset from the launch it binds to.
+    #[must_use]
+    pub fn inherit(self, launch: &Launch) -> Self {
+        Self {
+            worktree: self.worktree.or_else(|| launch.worktree.clone()),
+            terminal: self.terminal.or_else(|| launch.terminal.clone()),
+            wrapper: self.wrapper.or(Some(launch.wrapper)),
+            title: self.title.or_else(|| Some(launch.title.clone())),
+            parent: self.parent.or_else(|| launch.parent.clone()),
+            launch: Some(launch.id.clone()),
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -174,6 +308,9 @@ pub struct Session {
     worktree: Option<PathBuf>,
     terminal: Option<Terminal>,
     wrapper: Option<Wrapper>,
+    title: Option<Title>,
+    parent: Option<Handle>,
+    launch: Option<LaunchId>,
     started_at: DateTime<Utc>,
     state: State,
     links: Vec<Link>,
@@ -187,6 +324,9 @@ impl Session {
             worktree: registration.worktree,
             terminal: registration.terminal,
             wrapper: registration.wrapper,
+            title: registration.title,
+            parent: registration.parent,
+            launch: registration.launch,
             started_at: registration.started_at,
             state: State::Active,
             links: Vec::new(),
@@ -202,13 +342,23 @@ impl Session {
         }
     }
 
-    /// A resumed session re-registers: its location and process change and its links stay. An ended
-    /// session becomes active again; a pending close request survives.
+    /// A resumed session re-registers: its location and process change and its links stay, as do its
+    /// title, parent and launch unless the registration names new ones. An ended session becomes active
+    /// again; a pending close request survives.
     pub fn resume(&mut self, registration: Registration) {
         self.cwd = registration.cwd;
         self.worktree = registration.worktree;
         self.terminal = registration.terminal;
         self.wrapper = registration.wrapper;
+        if registration.title.is_some() {
+            self.title = registration.title;
+        }
+        if registration.parent.is_some() {
+            self.parent = registration.parent;
+        }
+        if registration.launch.is_some() {
+            self.launch = registration.launch;
+        }
         if let State::Ended { .. } = self.state {
             self.state = State::Active;
         }
@@ -225,23 +375,27 @@ impl Session {
         }
     }
 
+    /// Links `item` with `role` unless the session already links it, keeping the existing role.
+    pub fn link_if_absent(&mut self, item: WorkItemRef, role: Role, now: DateTime<Utc>) {
+        if !self.links.iter().any(|link| link.item == item) {
+            self.link(item, role, now);
+        }
+    }
+
     pub fn request_close(&mut self, now: DateTime<Utc>) -> Result<(), AlreadyEnded> {
-        match self.state {
-            State::Active => {
-                self.state = State::Closing { requested_at: now };
-                Ok(())
-            }
-            State::Closing { .. } => Ok(()),
-            State::Ended { .. } => Err(AlreadyEnded(self.handle.clone())),
+        if self.state.request_close(now) {
+            Ok(())
+        } else {
+            Err(AlreadyEnded(self.handle.clone()))
         }
     }
 
     pub fn end(&mut self, reason: EndReason, now: DateTime<Utc>) -> Result<(), AlreadyEnded> {
-        if let State::Ended { .. } = self.state {
-            return Err(AlreadyEnded(self.handle.clone()));
+        if self.state.end(reason, now) {
+            Ok(())
+        } else {
+            Err(AlreadyEnded(self.handle.clone()))
         }
-        self.state = State::Ended { at: now, reason };
-        Ok(())
     }
 
     pub fn handle(&self) -> &Handle {
@@ -264,6 +418,18 @@ impl Session {
         self.wrapper
     }
 
+    pub fn title(&self) -> Option<&Title> {
+        self.title.as_ref()
+    }
+
+    pub fn parent(&self) -> Option<&Handle> {
+        self.parent.as_ref()
+    }
+
+    pub fn launch(&self) -> Option<&LaunchId> {
+        self.launch.as_ref()
+    }
+
     pub fn started_at(&self) -> DateTime<Utc> {
         self.started_at
     }
@@ -273,7 +439,7 @@ impl Session {
     }
 
     pub fn is_closing(&self) -> bool {
-        matches!(self.state, State::Closing { .. })
+        self.state.is_closing()
     }
 
     pub fn links(&self) -> &[Link] {
@@ -297,7 +463,30 @@ mod tests {
             worktree: None,
             terminal: None,
             wrapper: None,
+            title: None,
+            parent: None,
+            launch: None,
             started_at: at(0),
+        }
+    }
+
+    fn launch() -> Launch {
+        Launch {
+            id: LaunchId::parse("u-1").unwrap(),
+            host: Host::parse("claude").unwrap(),
+            title: Title::parse("core 461").unwrap(),
+            cwd: "/w".into(),
+            worktree: Some("/w.worktrees/F".into()),
+            terminal: Some(Terminal::new("windows-terminal", Some("t")).unwrap()),
+            wrapper: Wrapper {
+                pid: 7,
+                started_at: at(0),
+            },
+            item: Some(item("461")),
+            parent: Some(Handle::parse("claude:parent").unwrap()),
+            created_at: at(0),
+            session: None,
+            state: State::Active,
         }
     }
 
@@ -358,6 +547,49 @@ mod tests {
         assert_eq!(session.state(), &State::Active);
         assert_eq!(session.cwd(), &PathBuf::from("/b"));
         assert_eq!(session.links().len(), 1);
+    }
+
+    #[test]
+    fn inheriting_a_launch_fills_only_unset_fields() {
+        let mut explicit = registration("/a");
+        explicit.title = Some(Title::parse("mine").unwrap());
+        let inherited = explicit.inherit(&launch());
+        assert_eq!(inherited.title.unwrap().as_str(), "mine");
+        assert_eq!(inherited.wrapper.unwrap().pid, 7);
+        assert_eq!(inherited.parent.unwrap().to_string(), "claude:parent");
+        assert_eq!(inherited.launch.unwrap().as_str(), "u-1");
+        assert_eq!(inherited.worktree.unwrap(), PathBuf::from("/w.worktrees/F"));
+        assert_eq!(inherited.cwd, PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn resume_keeps_title_and_parent_unless_replaced() {
+        let mut session = Session::register(registration("/a").inherit(&launch()));
+        session.resume(registration("/b"));
+        assert_eq!(session.title().unwrap().as_str(), "core 461");
+        assert_eq!(session.parent().unwrap().to_string(), "claude:parent");
+        let mut renamed = registration("/b");
+        renamed.title = Some(Title::parse("renamed").unwrap());
+        session.resume(renamed);
+        assert_eq!(session.title().unwrap().as_str(), "renamed");
+    }
+
+    #[test]
+    fn linking_if_absent_keeps_an_existing_role() {
+        let mut session = Session::register(registration("/a"));
+        session.link(item("1"), Role::parse("reviewer").unwrap(), at(1));
+        session.link_if_absent(item("1"), Role::parse("owner").unwrap(), at(2));
+        session.link_if_absent(item("2"), Role::parse("owner").unwrap(), at(2));
+        assert_eq!(session.links()[0].role.as_str(), "reviewer");
+        assert_eq!(session.links()[1].role.as_str(), "owner");
+    }
+
+    #[test]
+    fn titles_need_visible_text_and_launch_ids_no_whitespace() {
+        assert!(Title::parse("  ").is_err());
+        assert_eq!(Title::parse("core 461").unwrap().as_str(), "core 461");
+        assert!(LaunchId::parse("a b").is_err());
+        assert!(LaunchId::parse("").is_err());
     }
 
     #[test]
