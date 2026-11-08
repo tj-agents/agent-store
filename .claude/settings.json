@@ -15,8 +15,8 @@
     "cli@tj-agents": true,
     "engineering@tj-agents": true,
     "personal@tj-agents": true,
-    "rust-seaorm@tj-agents": true,
     "rust@tj-agents": true,
+    "seaorm@tj-agents": true,
     "workflow@tj-agents": true
   },
   "permissions": {
