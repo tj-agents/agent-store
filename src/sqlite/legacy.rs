@@ -171,6 +171,9 @@ fn to_session(
         worktree: None,
         terminal: None,
         wrapper: None,
+        title: None,
+        parent: None,
+        launch: None,
         started_at,
     });
     let role = legacy_role(row.role.as_deref());

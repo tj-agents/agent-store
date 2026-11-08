@@ -79,15 +79,22 @@ Every command prints exactly one JSON document to stdout (`--help` and `--versio
 
 A session is addressed by its handle, `host:session-id`, for example `claude:0f3c2a…`.
 
+A **launch** is a terminal tab started for an agent before the agent's host assigns a session id. The
+process that owns the tab records it under an id of its own choosing and hands that id to the agent; the
+agent's session then registers with `--launch-id` and inherits the launch's title, parent, terminal, wrapper
+and work item. A wrapper stops its agent when its launch or the bound session is `closing`.
+
 | Command | Result `data` |
 |---|---|
-| `register --session H --cwd DIR [--worktree DIR] [--terminal-kind K [--terminal-id ID]] [--wrapper-pid PID --wrapper-started-at TIME] [--started-at TIME]` | `{session}`. Relative paths resolve against the current directory. Re-registering a session (a resume) updates where it runs and keeps its links; an ended session becomes active again, and a pending close request stays. |
+| `launch --launch-id U --host H --title T --cwd DIR --wrapper-pid PID --wrapper-started-at TIME [--worktree DIR] [--item REF] [--terminal-kind K [--terminal-id ID]] [--parent H]` | `{launch}`. A launch id is recorded once. |
+| `register --session H --cwd DIR [--worktree DIR] [--terminal-kind K [--terminal-id ID]] [--wrapper-pid PID --wrapper-started-at TIME] [--title T] [--parent H] [--launch-id U] [--started-at TIME]` | `{session}`. Relative paths resolve against the current directory. Re-registering a session (a resume) updates where it runs and keeps its links, and its title and parent unless new ones are given; an ended session becomes active again, and a pending close request stays. With `--launch-id`, what the other arguments leave unset comes from that launch, the launch's item is linked as `owner` unless already linked, and the launch shows this session. |
 | `link --session H --item REF [--role owner]` | `{session}`. Linking again changes only the role. |
-| `end --session H [--reason closed]` | `{session}` |
-| `mark-closing --item REF` or `mark-closing --session H` | `{sessions}`: the sessions now `closing`. A wrapper that polls `show` stops its agent when it sees this. |
-| `sessions --item REF` | `{item, sessions}`, oldest first |
+| `end --session H [--reason closed]` or `end --launch-id U [--reason closed]` | `{session}` or `{launch}` |
+| `mark-closing --item REF`, `--session H` or `--launch-id U` | `{sessions, launches}`: those now `closing`. `--item` reaches every session linked to the item and every launch for it. |
+| `sessions --item REF` or `sessions --title T` | `{item, sessions}` or `{title, sessions}`, oldest first |
 | `items` | `{items: [{item, sessions: [{session, role}]}]}` for every item with a linked session |
-| `show H` | `{session}` |
+| `launches [--item REF]` | `{launches}`, oldest first |
+| `show H` or `show --launch-id U` | `{session}`, or `{launch, session}` where `session` is `null` until one registers |
 
 Times are RFC 3339, for example `2026-11-08T10:00:00Z`. A session object:
 
@@ -97,11 +104,27 @@ Times are RFC 3339, for example `2026-11-08T10:00:00Z`. A session object:
   "cwd": "/src/app", "worktree": "/src/app.worktrees/Feature-X",
   "terminal": {"kind": "windows-terminal", "id": "tab-7"},
   "wrapper": {"pid": 4242, "started_at": "2026-11-08T10:00:00Z"},
+  "title": "app 461", "parent": "claude:0f3c", "launch_id": "7d2e…",
   "started_at": "2026-11-08T10:00:01Z",
   "state": "active", "closing_requested_at": null, "ended_at": null, "end_reason": null,
   "links": [{"item": {"ref": "github:github.com/acme/app:461", "provider": "github",
              "scope": "github.com/acme/app", "native_id": "461"},
              "role": "owner", "linked_at": "2026-11-08T10:00:02Z"}]
+}
+```
+
+A launch object:
+
+```json
+{
+  "launch_id": "7d2e…", "host": "claude", "title": "app 461",
+  "cwd": "/src/app.worktrees/Feature-X", "worktree": "/src/app.worktrees/Feature-X",
+  "terminal": {"kind": "windows-terminal", "id": "tab-7"},
+  "wrapper": {"pid": 4242, "started_at": "2026-11-08T10:00:00Z"},
+  "item": {"ref": "github:github.com/acme/app:461", "provider": "github",
+           "scope": "github.com/acme/app", "native_id": "461"},
+  "parent": "claude:0f3c", "created_at": "2026-11-08T10:00:00Z", "session": "claude:abc",
+  "state": "active", "closing_requested_at": null, "ended_at": null, "end_reason": null
 }
 ```
 
@@ -138,6 +161,9 @@ async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         worktree: None,
         terminal: None,
         wrapper: None,
+        title: None,
+        parent: None,
+        launch: None,
         started_at: chrono::Utc::now(),
     };
     service::register(&store, registration).await?;
