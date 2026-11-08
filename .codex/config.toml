@@ -25,10 +25,10 @@ enabled = true
 [plugins."personal@tj-agents"]
 enabled = true
 
-[plugins."rust-seaorm@tj-agents"]
+[plugins."rust@tj-agents"]
 enabled = true
 
-[plugins."rust@tj-agents"]
+[plugins."seaorm@tj-agents"]
 enabled = true
 
 [plugins."workflow@tj-agents"]

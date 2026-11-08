@@ -12,8 +12,8 @@
     "cli@tj-agents",
     "engineering@tj-agents",
     "personal@tj-agents",
-    "rust-seaorm@tj-agents",
     "rust@tj-agents",
+    "seaorm@tj-agents",
     "workflow@tj-agents"
   ]
 }

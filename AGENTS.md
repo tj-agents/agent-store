@@ -1,6 +1,6 @@
 # agent-store
 
-Open-source Rust library and JSON CLI, edition 2024, toolchain `1.97.1`. The `rust:*` and `rust-seaorm:*`
+Open-source Rust library and JSON CLI, edition 2024, toolchain `1.97.1`. The `rust:*` and `seaorm:*`
 standards apply. `README.md` is written for outside users: keep tj-agents, machine and employer specifics
 out of the crate, its defaults and the README.
 
