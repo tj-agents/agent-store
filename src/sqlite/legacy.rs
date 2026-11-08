@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -8,20 +8,24 @@ use thiserror::Error;
 
 use super::Store;
 use crate::domain::reference::WorkItemRef;
-use crate::domain::session::ports::{LinkStore, StoreError};
+use crate::domain::session::ports::StoreError;
 use crate::domain::session::{EndReason, Handle, Registration, Role, Session};
 
 const LEGACY_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ImportSummary {
-    pub sessions: usize,
-    pub links: usize,
-    pub unlinked_references: usize,
+pub(crate) struct ImportSummary {
+    pub(crate) imported: usize,
+    pub(crate) already_present: usize,
+    pub(crate) incomplete: usize,
+    pub(crate) links: usize,
+    pub(crate) unlinked_references: usize,
 }
 
 #[derive(Debug, Error)]
-pub enum ImportError {
+pub(crate) enum ImportError {
+    #[error("legacy database {0} does not exist")]
+    Missing(PathBuf),
     #[error("cannot read the legacy database {path}")]
     Read {
         path: PathBuf,
@@ -56,12 +60,21 @@ struct LegacySession {
 }
 
 #[derive(FromQueryResult)]
+struct Count {
+    count: i64,
+}
+
+#[derive(FromQueryResult)]
 struct UserVersion {
     user_version: i64,
 }
 
-/// Imports references, sessions and links from the retired Python store (`sessions.db`, schema 4).
-pub async fn import(store: &Store, path: &Path) -> Result<ImportSummary, ImportError> {
+/// Imports sessions and their links from the retired Python store (`sessions.db`, schema 4) in one
+/// transaction, skipping sessions the store already holds.
+pub(crate) async fn import(store: &Store, path: &Path) -> Result<ImportSummary, ImportError> {
+    if !path.is_file() {
+        return Err(ImportError::Missing(path.to_path_buf()));
+    }
     let read = |source| ImportError::Read {
         path: path.to_path_buf(),
         source,
@@ -101,6 +114,13 @@ pub async fn import(store: &Store, path: &Path) -> Result<ImportSummary, ImportE
     .all(&legacy)
     .await
     .map_err(read)?;
+    let incomplete = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM sessions WHERE cwd IS NULL OR started_at IS NULL",
+    ))
+    .one(&legacy)
+    .await
+    .map_err(read)?
+    .map_or(0, |row| row.count);
     legacy.close_by_ref().await.map_err(read)?;
 
     let mut by_work_item: HashMap<&str, Vec<WorkItemRef>> = HashMap::new();
@@ -113,31 +133,29 @@ pub async fn import(store: &Store, path: &Path) -> Result<ImportSummary, ImportE
             .push(item);
     }
 
-    let mut summary = ImportSummary {
-        sessions: 0,
-        links: 0,
-        unlinked_references: 0,
-    };
-    let mut linked_work_items = std::collections::HashSet::new();
-    for row in &sessions {
-        let session = to_session(row, &by_work_item)?;
-        summary.links += session.links().len();
-        if let Some(work_item) = row
-            .work_item
-            .as_deref()
-            .filter(|key| by_work_item.contains_key(key))
-        {
-            linked_work_items.insert(work_item);
-        }
-        store.save(&session).await.map_err(ImportError::Store)?;
-        summary.sessions += 1;
-    }
-    summary.unlinked_references = by_work_item
+    let converted = sessions
         .iter()
-        .filter(|(key, _)| !linked_work_items.contains(*key))
-        .map(|(_, items)| items.len())
-        .sum();
-    Ok(summary)
+        .map(|row| to_session(row, &by_work_item))
+        .collect::<Result<Vec<_>, _>>()?;
+    let inserted = store
+        .insert_absent(&converted)
+        .await
+        .map_err(ImportError::Store)?;
+    let linked_work_items: HashSet<&str> = sessions
+        .iter()
+        .filter_map(|row| row.work_item.as_deref())
+        .collect();
+    Ok(ImportSummary {
+        imported: inserted.len(),
+        already_present: converted.len() - inserted.len(),
+        incomplete: usize::try_from(incomplete).unwrap_or_default(),
+        links: inserted.iter().map(|&i| converted[i].links().len()).sum(),
+        unlinked_references: by_work_item
+            .iter()
+            .filter(|(key, _)| !linked_work_items.contains(*key))
+            .map(|(_, items)| items.len())
+            .sum(),
+    })
 }
 
 fn to_session(

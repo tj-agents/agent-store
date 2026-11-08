@@ -15,7 +15,8 @@ caller, imports once and deletes the Python store and the import command.
 1. **Distribution.** `agent` pins an `agent-store` release version in one file and installs the matching
    archive into its runtime bin directory from its existing install step (`install.ps1`, `install.sh`),
    verifying the `.sha256`. Add a Renovate custom manager (github-releases datasource,
-   `tj-agents/agent-store`) for that file. Pass `--database ~/.agents-state/agent-store.db` (or set
+   `tj-agents/agent-store`) for that file. Assets are static: `x86_64-pc-windows-msvc.zip` and
+   `x86_64-unknown-linux-musl.tar.gz`. Pass `--database ~/.agents-state/agent-store.db` (or set
    `AGENT_STORE_DATABASE` once in the shared runtime) so every caller uses one file.
 2. **Callers.** Replace in-process `session_store` use with one helper that runs the CLI and parses its JSON
    (`schema_version` 1, exit codes 0–5):
@@ -36,7 +37,9 @@ caller, imports once and deletes the Python store and the import command.
 3. **Core.** Remove Core's path-load of the store (the `core#536` lockstep) in the same window; Core calls
    the CLI or nothing.
 4. **Import once.** `agent-store --database ~/.agents-state/agent-store.db import-legacy --from
-   ~/.agents-state/sessions.db` on each machine that has a `sessions.db`; record the summary in the PR.
+   ~/.agents-state/sessions.db` (a hidden command) on each machine that has a `sessions.db`; record the
+   summary (`imported`, `already_present`, `incomplete`, `links`) in the PR. It runs in one transaction
+   and never overwrites a session the new hooks already registered, so it may run before or after step 2.
 5. **Delete.** The Python store (`.agents/agent-store/runtime/`), its loader and observer-staging lists,
    `tests/test_session_store.py` / `test_agent_store.py` and other store-only tests, then in `agent-store`
    remove `import-legacy` and `src/sqlite/legacy.rs` in a release after the import.

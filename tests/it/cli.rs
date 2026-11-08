@@ -123,8 +123,42 @@ fn json_request_on_stdin() {
         r#"{{"command":"link","session":"claude:j","item":"{ITEM}"}}"#
     ));
     assert_eq!(run.json["data"]["session"]["links"][0]["role"], "owner");
-    let run = fixture.run_input(r#"{"command":"items","surprise":1}"#);
-    assert_eq!(run.code, 0, "{}", run.json);
+    let run = fixture.run_input(&format!(
+        r#"{{"command":"link","session":"claude:j","item":"{ITEM}","roel":"reviewer"}}"#
+    ));
+    assert_eq!(run.code, 2, "{}", run.json);
+    let run = fixture
+        .run_input(r#"{"command":"register","session":"claude:k","cwd":"/w","terminal_id":"%3"}"#);
+    assert_eq!(run.code, 2, "{}", run.json);
+}
+
+#[test]
+fn relative_paths_are_stored_absolute() {
+    let fixture = Fixture::new();
+    let data = fixture.ok(&[
+        "register",
+        "--session",
+        "claude:rel",
+        "--cwd",
+        "sub",
+        "--worktree",
+        "wt",
+    ]);
+    let expected = fixture.dir.path().join("sub");
+    assert_eq!(data["session"]["cwd"], expected.to_str().unwrap());
+    assert_eq!(
+        data["session"]["worktree"],
+        fixture.dir.path().join("wt").to_str().unwrap()
+    );
+}
+
+#[test]
+fn re_registering_keeps_a_pending_close_request() {
+    let fixture = Fixture::new();
+    register(&fixture, "claude:c");
+    fixture.ok(&["mark-closing", "--session", "claude:c"]);
+    let again = fixture.ok(&["register", "--session", "claude:c", "--cwd", "/work/core"]);
+    assert_eq!(again["session"]["state"], "closing");
 }
 
 #[test]

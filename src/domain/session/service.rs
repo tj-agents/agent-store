@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
@@ -40,15 +42,19 @@ pub async fn register(
     store: &impl LinkStore,
     registration: Registration,
 ) -> Result<Session, StoreError> {
-    let session = match store.find(&registration.handle).await? {
-        Some(mut session) => {
-            session.resume(registration);
-            session
-        }
-        None => Session::register(registration),
-    };
-    store.save(&session).await?;
-    Ok(session)
+    let handle = registration.handle.clone();
+    let session = store
+        .update(&handle, |existing| {
+            Ok::<_, Infallible>(match existing {
+                Some(mut session) => {
+                    session.resume(registration);
+                    session
+                }
+                None => Session::register(registration),
+            })
+        })
+        .await?;
+    Ok(session.unwrap_or_else(|never| match never {}))
 }
 
 pub async fn link(
@@ -58,12 +64,15 @@ pub async fn link(
     role: Role,
     now: DateTime<Utc>,
 ) -> Result<Session, LinkError> {
-    let mut session = registered(store, handle)
+    store
+        .update(handle, |session| {
+            let mut session = registered(session, handle)?;
+            session.link(item, role, now);
+            Ok(session)
+        })
         .await
-        .map_err(|e| e.either(LinkError::NotRegistered, LinkError::Store))?;
-    session.link(item, role, now);
-    store.save(&session).await.map_err(LinkError::Store)?;
-    Ok(session)
+        .map_err(LinkError::Store)?
+        .map_err(LinkError::NotRegistered)
 }
 
 pub async fn end(
@@ -72,12 +81,14 @@ pub async fn end(
     reason: EndReason,
     now: DateTime<Utc>,
 ) -> Result<Session, EndError> {
-    let mut session = registered(store, handle)
+    store
+        .update(handle, |session| {
+            let mut session = registered(session, handle).map_err(EndError::NotRegistered)?;
+            session.end(reason, now).map_err(EndError::AlreadyEnded)?;
+            Ok(session)
+        })
         .await
-        .map_err(|e| e.either(EndError::NotRegistered, EndError::Store))?;
-    session.end(reason, now).map_err(EndError::AlreadyEnded)?;
-    store.save(&session).await.map_err(EndError::Store)?;
-    Ok(session)
+        .map_err(EndError::Store)?
 }
 
 /// Asks one session's wrapper to close it.
@@ -86,12 +97,14 @@ pub async fn mark_session_closing(
     handle: &Handle,
     now: DateTime<Utc>,
 ) -> Result<Session, EndError> {
-    let mut session = registered(store, handle)
+    store
+        .update(handle, |session| {
+            let mut session = registered(session, handle).map_err(EndError::NotRegistered)?;
+            session.request_close(now).map_err(EndError::AlreadyEnded)?;
+            Ok(session)
+        })
         .await
-        .map_err(|e| e.either(EndError::NotRegistered, EndError::Store))?;
-    session.request_close(now).map_err(EndError::AlreadyEnded)?;
-    store.save(&session).await.map_err(EndError::Store)?;
-    Ok(session)
+        .map_err(EndError::Store)?
 }
 
 /// Asks the wrapper of every session linked to `item` that has not ended to close it.
@@ -100,20 +113,16 @@ pub async fn mark_item_closing(
     item: &WorkItemRef,
     now: DateTime<Utc>,
 ) -> Result<Vec<Session>, StoreError> {
-    let mut marked = Vec::new();
-    for mut session in store.sessions_for(item).await? {
-        if session.request_close(now).is_ok() {
-            store.save(&session).await?;
-            marked.push(session);
-        }
-    }
-    Ok(marked)
+    store
+        .update_linked(item, |session| {
+            !session.is_closing() && session.request_close(now).is_ok()
+        })
+        .await
 }
 
 pub async fn show(store: &impl LinkStore, handle: &Handle) -> Result<Session, ShowError> {
-    registered(store, handle)
-        .await
-        .map_err(|e| e.either(ShowError::NotRegistered, ShowError::Store))
+    registered(store.find(handle).await.map_err(ShowError::Store)?, handle)
+        .map_err(ShowError::NotRegistered)
 }
 
 pub async fn sessions(
@@ -127,28 +136,6 @@ pub async fn items(store: &impl LinkStore) -> Result<Vec<Item>, StoreError> {
     store.items().await
 }
 
-enum Lookup {
-    NotRegistered(NotRegistered),
-    Store(StoreError),
-}
-
-impl Lookup {
-    fn either<E>(
-        self,
-        missing: impl FnOnce(NotRegistered) -> E,
-        store: impl FnOnce(StoreError) -> E,
-    ) -> E {
-        match self {
-            Self::NotRegistered(e) => missing(e),
-            Self::Store(e) => store(e),
-        }
-    }
-}
-
-async fn registered(store: &impl LinkStore, handle: &Handle) -> Result<Session, Lookup> {
-    store
-        .find(handle)
-        .await
-        .map_err(Lookup::Store)?
-        .ok_or_else(|| Lookup::NotRegistered(NotRegistered(handle.clone())))
+fn registered(session: Option<Session>, handle: &Handle) -> Result<Session, NotRegistered> {
+    session.ok_or_else(|| NotRegistered(handle.clone()))
 }

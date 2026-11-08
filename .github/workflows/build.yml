@@ -1,0 +1,64 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      ARCHIVE: agent-store-v${{ inputs.version }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - run: rustup toolchain install && rustup target add ${{ matrix.target }}
+      - name: build (Linux, static musl)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          cargo build --release --locked --target ${{ matrix.target }}
+          file -b target/${{ matrix.target }}/release/agent-store | grep -E -q 'static(ally|-pie) linked'
+          target/${{ matrix.target }}/release/agent-store --database "$RUNNER_TEMP/check.db" items
+          tar -czf "$ARCHIVE.tar.gz" -C target/${{ matrix.target }}/release agent-store
+          sha256sum "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
+      - name: build (Windows, static CRT)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+          if ($LASTEXITCODE) { exit 1 }
+          $exe = "target/${{ matrix.target }}/release/agent-store.exe"
+          & $exe --database "$env:RUNNER_TEMP/check.db" items
+          if ($LASTEXITCODE) { exit 1 }
+          Compress-Archive -Path $exe -DestinationPath "$env:ARCHIVE.zip"
+          $hash = (Get-FileHash "$env:ARCHIVE.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:ARCHIVE.zip" | Out-File -Encoding ascii -NoNewline "$env:ARCHIVE.zip.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}.*
+          if-no-files-found: error
+          retention-days: 7

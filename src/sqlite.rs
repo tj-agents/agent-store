@@ -1,5 +1,5 @@
 mod entity;
-pub mod legacy;
+pub(crate) mod legacy;
 mod migration;
 
 use std::collections::HashMap;
@@ -10,8 +10,9 @@ use sea_orm::sea_query::OnConflict;
 use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sea_orm::{
     ActiveValue::{NotSet, Set},
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    SqlxSqliteConnector, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait,
+    QueryFilter, QueryOrder, SqliteTransactionMode, SqlxSqliteConnector, TransactionOptions,
+    TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 use thiserror::Error;
@@ -53,10 +54,6 @@ pub enum OpenError {
     },
 }
 
-#[derive(Debug, Error)]
-#[error("stored row is invalid: {0}")]
-struct InvalidRow(String);
-
 impl Store {
     /// Opens or creates the database at `path` and applies pending migrations.
     pub async fn open(path: &Path) -> Result<Self, OpenError> {
@@ -88,118 +85,80 @@ impl Store {
         Ok(Self { db })
     }
 
-    async fn save_session(&self, session: &Session) -> Result<(), DbErr> {
-        let txn = self.db.begin().await?;
-        let row = session::Entity::insert(session_row(session))
-            .on_conflict(
-                OnConflict::columns([session::Column::Host, session::Column::NativeId])
-                    .update_columns([
-                        session::Column::Cwd,
-                        session::Column::WorktreePath,
-                        session::Column::TerminalKind,
-                        session::Column::TerminalId,
-                        session::Column::WrapperPid,
-                        session::Column::WrapperStartedAt,
-                        session::Column::ClosingRequestedAt,
-                        session::Column::EndedAt,
-                        session::Column::EndReason,
-                    ])
-                    .to_owned(),
-            )
-            .exec_with_returning(&txn)
-            .await?;
-        for link in session.links() {
-            let reference = reference_id(&txn, &link.item).await?;
-            session_link::Entity::insert(session_link::ActiveModel {
-                session_id: Set(row.id),
-                reference_id: Set(reference),
-                role: Set(link.role.as_str().to_owned()),
-                linked_at: Set(link.linked_at),
+    async fn write(&self) -> Result<DatabaseTransaction, StoreError> {
+        self.db
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..TransactionOptions::default()
             })
-            .on_conflict(
-                OnConflict::columns([
-                    session_link::Column::SessionId,
-                    session_link::Column::ReferenceId,
-                ])
-                .update_column(session_link::Column::Role)
-                .to_owned(),
-            )
-            .exec_without_returning(&txn)
-            .await?;
-        }
-        txn.commit().await
+            .await
+            .map_err(unavailable)
     }
 
-    async fn load(&self, rows: Vec<session::Model>) -> Result<Vec<Session>, StoreError> {
-        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
-        let mut links: HashMap<i64, Vec<Link>> = HashMap::new();
-        for (link, reference) in session_link::Entity::find()
-            .filter(session_link::Column::SessionId.is_in(ids))
-            .find_also_related(work_item_reference::Entity)
-            .order_by_asc(session_link::Column::LinkedAt)
-            .all(&self.db)
-            .await
-            .map_err(unavailable)?
-        {
-            let reference = reference.ok_or_else(|| {
-                invalid(format!(
-                    "link of session {} has no reference",
-                    link.session_id
-                ))
-            })?;
-            let session_id = link.session_id;
-            links
-                .entry(session_id)
-                .or_default()
-                .push(to_link(&link, &reference)?);
+    /// Saves each session whose handle is not stored yet, in one transaction; returns their indexes.
+    pub(crate) async fn insert_absent(
+        &self,
+        sessions: &[Session],
+    ) -> Result<Vec<usize>, StoreError> {
+        let txn = self.write().await?;
+        let mut inserted = Vec::new();
+        for (index, session) in sessions.iter().enumerate() {
+            if find_row(&txn, session.handle()).await?.is_none() {
+                save(&txn, session).await.map_err(unavailable)?;
+                inserted.push(index);
+            }
         }
-        rows.into_iter()
-            .map(|row| {
-                let session_links = links.remove(&row.id).unwrap_or_default();
-                to_session(row, session_links)
-            })
-            .collect()
+        txn.commit().await.map_err(unavailable)?;
+        Ok(inserted)
     }
 }
 
 impl LinkStore for Store {
     async fn find(&self, handle: &Handle) -> Result<Option<Session>, StoreError> {
-        let row = session::Entity::find()
-            .filter(session::Column::Host.eq(handle.host().as_str()))
-            .filter(session::Column::NativeId.eq(handle.native_id()))
-            .one(&self.db)
-            .await
-            .map_err(unavailable)?;
-        Ok(self.load(row.into_iter().collect()).await?.pop())
+        let row = find_row(&self.db, handle).await?;
+        Ok(load(&self.db, row.into_iter().collect()).await?.pop())
     }
 
-    async fn save(&self, session: &Session) -> Result<(), StoreError> {
-        self.save_session(session).await.map_err(unavailable)
+    async fn update<E: Send>(
+        &self,
+        handle: &Handle,
+        change: impl FnOnce(Option<Session>) -> Result<Session, E> + Send,
+    ) -> Result<Result<Session, E>, StoreError> {
+        let txn = self.write().await?;
+        let row = find_row(&txn, handle).await?;
+        let current = load(&txn, row.into_iter().collect()).await?.pop();
+        match change(current) {
+            Ok(session) => {
+                save(&txn, &session).await.map_err(unavailable)?;
+                txn.commit().await.map_err(unavailable)?;
+                Ok(Ok(session))
+            }
+            Err(error) => {
+                txn.rollback().await.map_err(unavailable)?;
+                Ok(Err(error))
+            }
+        }
+    }
+
+    async fn update_linked(
+        &self,
+        item: &WorkItemRef,
+        mut change: impl FnMut(&mut Session) -> bool + Send,
+    ) -> Result<Vec<Session>, StoreError> {
+        let txn = self.write().await?;
+        let mut changed = Vec::new();
+        for mut session in linked(&txn, item).await? {
+            if change(&mut session) {
+                save(&txn, &session).await.map_err(unavailable)?;
+                changed.push(session);
+            }
+        }
+        txn.commit().await.map_err(unavailable)?;
+        Ok(changed)
     }
 
     async fn sessions_for(&self, item: &WorkItemRef) -> Result<Vec<Session>, StoreError> {
-        let rows = session::Entity::find()
-            .inner_join(session_link::Entity)
-            .filter(
-                session_link::Column::ReferenceId.in_subquery(
-                    sea_orm::sea_query::Query::select()
-                        .column(work_item_reference::Column::Id)
-                        .from(work_item_reference::Entity)
-                        .and_where(
-                            work_item_reference::Column::Provider.eq(item.provider().as_str()),
-                        )
-                        .and_where(work_item_reference::Column::Scope.eq(item.scope().as_str()))
-                        .and_where(
-                            work_item_reference::Column::NativeId.eq(item.native_id().as_str()),
-                        )
-                        .to_owned(),
-                ),
-            )
-            .order_by_asc(session::Column::StartedAt)
-            .all(&self.db)
-            .await
-            .map_err(unavailable)?;
-        self.load(rows).await
+        linked(&self.db, item).await
     }
 
     async fn items(&self) -> Result<Vec<Item>, StoreError> {
@@ -224,7 +183,7 @@ impl LinkStore for Store {
                     .into_iter()
                     .map(|link| {
                         let handle = handles.get(&link.session_id).cloned().ok_or_else(|| {
-                            invalid(format!("link to missing session {}", link.session_id))
+                            corrupt(format!("link to missing session {}", link.session_id))
                         })?;
                         Ok((handle, parse_role(&link.role)?))
                     })
@@ -241,15 +200,125 @@ impl LinkStore for Store {
 }
 
 async fn migrate(db: &DatabaseConnection) -> Result<(), DbErr> {
-    if Migrator::get_pending_migrations(db).await?.is_empty() {
-        return Ok(());
+    let mut pending = Migrator::get_pending_migrations(db).await?.len();
+    while pending > 0 {
+        let Err(error) = Migrator::up(db, None).await else {
+            return Ok(());
+        };
+        // Another process may be applying the same migrations; retry while it makes progress.
+        match Migrator::get_pending_migrations(db).await {
+            Ok(now) if now.len() < pending => pending = now.len(),
+            _ => return Err(error),
+        }
     }
-    match Migrator::up(db, None).await {
-        Ok(()) => Ok(()),
-        // Another process may have applied the same migrations between the check and `up`.
-        Err(_) if Migrator::get_pending_migrations(db).await?.is_empty() => Ok(()),
-        Err(e) => Err(e),
+    Ok(())
+}
+
+async fn find_row(
+    db: &impl ConnectionTrait,
+    handle: &Handle,
+) -> Result<Option<session::Model>, StoreError> {
+    session::Entity::find()
+        .filter(session::Column::Host.eq(handle.host().as_str()))
+        .filter(session::Column::NativeId.eq(handle.native_id()))
+        .one(db)
+        .await
+        .map_err(unavailable)
+}
+
+async fn linked(db: &impl ConnectionTrait, item: &WorkItemRef) -> Result<Vec<Session>, StoreError> {
+    let rows = session::Entity::find()
+        .inner_join(session_link::Entity)
+        .filter(
+            session_link::Column::ReferenceId.in_subquery(
+                sea_orm::sea_query::Query::select()
+                    .column(work_item_reference::Column::Id)
+                    .from(work_item_reference::Entity)
+                    .and_where(work_item_reference::Column::Provider.eq(item.provider().as_str()))
+                    .and_where(work_item_reference::Column::Scope.eq(item.scope().as_str()))
+                    .and_where(work_item_reference::Column::NativeId.eq(item.native_id().as_str()))
+                    .to_owned(),
+            ),
+        )
+        .order_by_asc(session::Column::StartedAt)
+        .all(db)
+        .await
+        .map_err(unavailable)?;
+    load(db, rows).await
+}
+
+async fn load(
+    db: &impl ConnectionTrait,
+    rows: Vec<session::Model>,
+) -> Result<Vec<Session>, StoreError> {
+    let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+    let mut links: HashMap<i64, Vec<Link>> = HashMap::new();
+    for (link, reference) in session_link::Entity::find()
+        .filter(session_link::Column::SessionId.is_in(ids))
+        .find_also_related(work_item_reference::Entity)
+        .order_by_asc(session_link::Column::LinkedAt)
+        .all(db)
+        .await
+        .map_err(unavailable)?
+    {
+        let reference = reference.ok_or_else(|| {
+            corrupt(format!(
+                "link of session {} has no reference",
+                link.session_id
+            ))
+        })?;
+        links
+            .entry(link.session_id)
+            .or_default()
+            .push(to_link(&link, &reference)?);
     }
+    rows.into_iter()
+        .map(|row| {
+            let session_links = links.remove(&row.id).unwrap_or_default();
+            to_session(row, session_links)
+        })
+        .collect()
+}
+
+async fn save(db: &impl ConnectionTrait, session: &Session) -> Result<(), DbErr> {
+    let row = session::Entity::insert(session_row(session))
+        .on_conflict(
+            OnConflict::columns([session::Column::Host, session::Column::NativeId])
+                .update_columns([
+                    session::Column::Cwd,
+                    session::Column::WorktreePath,
+                    session::Column::TerminalKind,
+                    session::Column::TerminalId,
+                    session::Column::WrapperPid,
+                    session::Column::WrapperStartedAt,
+                    session::Column::ClosingRequestedAt,
+                    session::Column::EndedAt,
+                    session::Column::EndReason,
+                ])
+                .to_owned(),
+        )
+        .exec_with_returning(db)
+        .await?;
+    for link in session.links() {
+        let reference = reference_id(db, &link.item).await?;
+        session_link::Entity::insert(session_link::ActiveModel {
+            session_id: Set(row.id),
+            reference_id: Set(reference),
+            role: Set(link.role.as_str().to_owned()),
+            linked_at: Set(link.linked_at),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                session_link::Column::SessionId,
+                session_link::Column::ReferenceId,
+            ])
+            .update_column(session_link::Column::Role)
+            .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn reference_id(db: &impl ConnectionTrait, item: &WorkItemRef) -> Result<i64, DbErr> {
@@ -297,8 +366,8 @@ fn session_row(session: &Session) -> session::ActiveModel {
 }
 
 fn handle_of(row: &session::Model) -> Result<Handle, StoreError> {
-    let host = Host::parse(&row.host).map_err(|e| invalid(e.to_string()))?;
-    Handle::new(host, &row.native_id).map_err(|e| invalid(e.to_string()))
+    let host = Host::parse(&row.host).map_err(|e| corrupt(e.to_string()))?;
+    Handle::new(host, &row.native_id).map_err(|e| corrupt(e.to_string()))
 }
 
 fn to_session(row: session::Model, links: Vec<Link>) -> Result<Session, StoreError> {
@@ -308,10 +377,10 @@ fn to_session(row: session::Model, links: Vec<Link>) -> Result<Session, StoreErr
         .as_deref()
         .map(|kind| Terminal::new(kind, row.terminal_id.as_deref()))
         .transpose()
-        .map_err(|e| invalid(e.to_string()))?;
+        .map_err(|e| corrupt(e.to_string()))?;
     let wrapper = match (row.wrapper_pid, row.wrapper_started_at) {
         (Some(pid), Some(started_at)) => Some(Wrapper {
-            pid: u32::try_from(pid).map_err(|e| invalid(e.to_string()))?,
+            pid: u32::try_from(pid).map_err(|e| corrupt(e.to_string()))?,
             started_at,
         }),
         _ => None,
@@ -319,11 +388,11 @@ fn to_session(row: session::Model, links: Vec<Link>) -> Result<Session, StoreErr
     let state = match (row.ended_at, row.end_reason, row.closing_requested_at) {
         (Some(at), Some(reason), _) => State::Ended {
             at,
-            reason: EndReason::parse(&reason).map_err(|e| invalid(e.to_string()))?,
+            reason: EndReason::parse(&reason).map_err(|e| corrupt(e.to_string()))?,
         },
         (None, None, Some(requested_at)) => State::Closing { requested_at },
         (None, None, None) => State::Active,
-        _ => return Err(invalid(format!("session {handle} has an inconsistent end"))),
+        _ => return Err(corrupt(format!("session {handle} has an inconsistent end"))),
     };
     let registration = Registration {
         handle,
@@ -337,7 +406,7 @@ fn to_session(row: session::Model, links: Vec<Link>) -> Result<Session, StoreErr
 }
 
 fn to_reference(row: &work_item_reference::Model) -> Result<WorkItemRef, StoreError> {
-    WorkItemRef::new(&row.provider, &row.scope, &row.native_id).map_err(|e| invalid(e.to_string()))
+    WorkItemRef::new(&row.provider, &row.scope, &row.native_id).map_err(|e| corrupt(e.to_string()))
 }
 
 fn to_link(
@@ -352,13 +421,13 @@ fn to_link(
 }
 
 fn parse_role(text: &str) -> Result<Role, StoreError> {
-    Role::parse(text).map_err(|e| invalid(e.to_string()))
+    Role::parse(text).map_err(|e| corrupt(e.to_string()))
 }
 
 fn unavailable(error: DbErr) -> StoreError {
-    StoreError(Box::new(error))
+    StoreError::Unavailable(Box::new(error))
 }
 
-fn invalid(detail: String) -> StoreError {
-    StoreError(Box::new(InvalidRow(detail)))
+fn corrupt(detail: String) -> StoreError {
+    StoreError::Corrupt(detail)
 }
