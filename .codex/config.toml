@@ -25,6 +25,9 @@ enabled = true
 [plugins."personal@tj-agents"]
 enabled = true
 
+[plugins."rust-seaorm@tj-agents"]
+enabled = true
+
 [plugins."rust@tj-agents"]
 enabled = true
 
