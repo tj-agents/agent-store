@@ -12,6 +12,7 @@
     "cli@tj-agents",
     "engineering@tj-agents",
     "personal@tj-agents",
+    "rust@tj-agents",
     "workflow@tj-agents"
   ]
 }
