@@ -60,6 +60,8 @@ pub trait LinkStore {
         title: &Title,
     ) -> impl Future<Output = Result<Vec<Session>, StoreError>> + Send;
 
+    fn all_sessions(&self) -> impl Future<Output = Result<Vec<Session>, StoreError>> + Send;
+
     fn items(&self) -> impl Future<Output = Result<Vec<Item>, StoreError>> + Send;
 
     fn create_launch(

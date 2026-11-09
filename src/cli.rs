@@ -147,9 +147,9 @@ enum Command {
         #[arg(long)]
         item: Option<String>,
     },
-    /// List the sessions linked to a work item, or titled `--title`.
+    /// List every session, the sessions linked to a work item, or those titled `--title`.
     Sessions {
-        #[arg(long, required_unless_present = "title", conflicts_with = "title")]
+        #[arg(long, conflicts_with = "title")]
         item: Option<String>,
         #[arg(long)]
         title: Option<String>,
@@ -492,7 +492,15 @@ async fn dispatch(
                     "sessions": sessions.iter().map(SessionView::from).collect::<Vec<_>>(),
                 }))
             }
-            _ => Err(Failure::invalid("pass exactly one of item or title")),
+            (None, None) => {
+                let sessions = service::all_sessions(store)
+                    .await
+                    .map_err(|e| storage(&e))?;
+                Ok(json!({
+                    "sessions": sessions.iter().map(SessionView::from).collect::<Vec<_>>(),
+                }))
+            }
+            (Some(_), Some(_)) => unreachable!("clap rejects --item with --title"),
         },
         Command::Items => {
             let items = service::items(store).await.map_err(|e| storage(&e))?;
