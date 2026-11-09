@@ -3,7 +3,6 @@
 
 mod cli;
 mod launch;
-mod legacy;
 mod store;
 
 use std::io::Write;

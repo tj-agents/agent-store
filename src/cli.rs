@@ -20,7 +20,7 @@ use crate::domain::session::{
     Wrapper,
 };
 use crate::git;
-use crate::sqlite::{Store, legacy};
+use crate::sqlite::Store;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const DATABASE_ENV: &str = "AGENT_STORE_DATABASE";
@@ -162,11 +162,6 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         launch_id: Option<String>,
-    },
-    #[command(hide = true)]
-    ImportLegacy {
-        #[arg(long)]
-        from: PathBuf,
     },
 }
 
@@ -528,26 +523,6 @@ async fn dispatch(
             }
             _ => Err(Failure::invalid("pass exactly one of session or launch_id")),
         },
-        Command::ImportLegacy { from } => {
-            let summary = legacy::import(store, &from).await.map_err(|e| {
-                let code = match e {
-                    legacy::ImportError::Missing(_)
-                    | legacy::ImportError::SchemaVersion { .. }
-                    | legacy::ImportError::InvalidRow(_) => Code::InvalidInput,
-                    legacy::ImportError::Read { .. } | legacy::ImportError::Store(_) => {
-                        Code::Storage
-                    }
-                };
-                Failure::new(code, &e)
-            })?;
-            Ok(json!({
-                "imported": summary.imported,
-                "already_present": summary.already_present,
-                "incomplete": summary.incomplete,
-                "links": summary.links,
-                "unlinked_references": summary.unlinked_references,
-            }))
-        }
     }
 }
 
