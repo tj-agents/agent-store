@@ -1,5 +1,4 @@
 mod entity;
-pub(crate) mod legacy;
 mod migration;
 
 use std::collections::HashMap;
@@ -95,23 +94,6 @@ impl Store {
             })
             .await
             .map_err(unavailable)
-    }
-
-    /// Saves each session whose handle is not stored yet, in one transaction; returns their indexes.
-    pub(crate) async fn insert_absent(
-        &self,
-        sessions: &[Session],
-    ) -> Result<Vec<usize>, StoreError> {
-        let txn = self.write().await?;
-        let mut inserted = Vec::new();
-        for (index, session) in sessions.iter().enumerate() {
-            if find_row(&txn, session.handle()).await?.is_none() {
-                save(&txn, session).await.map_err(unavailable)?;
-                inserted.push(index);
-            }
-        }
-        txn.commit().await.map_err(unavailable)?;
-        Ok(inserted)
     }
 }
 
