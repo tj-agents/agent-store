@@ -165,6 +165,15 @@ impl LinkStore for Store {
         load(&self.db, rows).await
     }
 
+    async fn all_sessions(&self) -> Result<Vec<Session>, StoreError> {
+        let rows = session::Entity::find()
+            .order_by_asc(session::Column::StartedAt)
+            .all(&self.db)
+            .await
+            .map_err(unavailable)?;
+        load(&self.db, rows).await
+    }
+
     async fn create_launch(
         &self,
         launch: Launch,
