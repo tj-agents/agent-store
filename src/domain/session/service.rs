@@ -293,6 +293,10 @@ pub async fn titled(store: &impl LinkStore, title: &Title) -> Result<Vec<Session
     store.titled(title).await
 }
 
+pub async fn all_sessions(store: &impl LinkStore) -> Result<Vec<Session>, StoreError> {
+    store.all_sessions().await
+}
+
 pub async fn items(store: &impl LinkStore) -> Result<Vec<Item>, StoreError> {
     store.items().await
 }

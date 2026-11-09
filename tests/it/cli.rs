@@ -73,6 +73,27 @@ fn an_item_lists_every_linked_agent() {
 }
 
 #[test]
+fn sessions_without_a_filter_lists_every_session_linked_or_not() {
+    let fixture = Fixture::new();
+    fixture.ok(&["register", "--session", "claude:linked", "--cwd", "/w"]);
+    fixture.ok(&["register", "--session", "codex:unlinked", "--cwd", "/w"]);
+    fixture.ok(&["link", "--session", "claude:linked", "--item", ITEM]);
+    fixture.ok(&["end", "--session", "codex:unlinked"]);
+
+    let sessions = fixture.ok(&["sessions"]);
+    let listed: Vec<(&str, &str)> = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["session"].as_str().unwrap(), s["state"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        listed,
+        [("claude:linked", "active"), ("codex:unlinked", "ended")]
+    );
+}
+
+#[test]
 fn mark_closing_then_end() {
     let fixture = Fixture::new();
     register(&fixture, "claude:a");
