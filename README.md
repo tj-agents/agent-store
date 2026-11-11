@@ -15,6 +15,7 @@ It stores **links only**:
   its working directory and worktree, the terminal tab or pane it runs in, the pid and start time of the
   process that owns that tab, and when it started, was asked to close, and ended;
 - which sessions are linked to which items, with an advisory role such as `owner` or `reviewer`.
+- explicit worktree ownership, retaining every claimed path for a session and its optional launch.
 
 It does **not** store:
 
@@ -74,7 +75,7 @@ Every command prints exactly one JSON document to stdout (`--help` and `--versio
 | 1 | `unexpected` | an internal failure |
 | 2 | `invalid-input` | bad arguments, reference, handle or JSON request |
 | 3 | `not-found` | the session is not registered |
-| 4 | `conflict` | the session has already ended |
+| 4 | `conflict` | the session has already ended, its launch binding differs, or another owner holds the worktree |
 | 5 | `storage` | the database cannot be opened, migrated, read or written, or holds invalid data |
 
 A session is addressed by its handle, `host:session-id`, for example `claude:0f3c2a…`.
@@ -95,6 +96,9 @@ and work item. A wrapper stops its agent when its launch or the bound session is
 | `items` | `{items: [{item, sessions: [{session, role}]}]}` for every item with a linked session |
 | `launches [--item REF]` | `{launches}`, oldest first |
 | `show H` or `show --launch-id U` | `{session}`, or `{launch, session}` where `session` is `null` until one registers |
+| `claim-worktree --session H [--launch-id U] --path DIR` | `{worktree}`. Claim an existing canonical directory for an active session and its exact active launch binding. |
+| `worktrees --session H [--launch-id U]` | `{worktrees}`, sorted by path, for that exact session/launch pair. Omitting the launch selects unmanaged ownership only. |
+| `release-worktree --session H [--launch-id U] --path PATH` | `{released: true}`. Release only that owner's claim; repeating an absent release succeeds. |
 
 Times are RFC 3339, for example `2026-11-08T10:00:00Z`. A session object:
 
@@ -130,6 +134,24 @@ A launch object:
 
 Writes are atomic: each command reads, changes and saves inside one write transaction, so commands run
 in parallel by several processes never undo each other.
+
+### Worktree ownership
+
+```sh
+agent-store claim-worktree --session codex:abc --launch-id run-1 --path /src/app/.worktrees/Fix-Parser
+agent-store worktrees --session codex:abc --launch-id run-1
+agent-store release-worktree --session codex:abc --launch-id run-1 --path /src/app/.worktrees/Fix-Parser
+```
+
+Claim after creating the directory. The claim command resolves its canonical path and returns
+`{path, session, launch_id, claimed_at}`. Keep that exact returned path for release, including on Windows;
+release works after the directory has disappeared. Repeating a claim by the same owner preserves its
+original timestamp. A competing owner cannot claim or release the path, even after the owning session ends.
+
+A session may own several worktrees across repositories. Re-registering it or ending its session or launch
+preserves those claims. The caller releases each claim only after its cleanup succeeds. The store records
+ownership; callers still establish whether a Git worktree is clean, merged and safe to remove. Existing
+`cwd` and `worktree` fields describe location and do not create ownership claims during an upgrade.
 
 `state` is `active`, `closing` or `ended`. New fields may be added within a schema version; a field is never
 removed or changed in meaning without incrementing `schema_version`.
@@ -178,6 +200,9 @@ async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ```
 
 `domain::session::ports::LinkStore` is the storage port; `sqlite::Store` implements it with SeaORM.
+`domain::worktree::ports::Store` supplies atomic ownership updates and listing. The corresponding
+`service::claim` and `service::release` take an `Owner` and a validated `worktree::Path`. Library callers
+canonicalize an existing directory before constructing a claim path, then retain the stored path for release.
 
 ## Development
 

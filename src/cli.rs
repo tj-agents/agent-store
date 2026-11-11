@@ -19,6 +19,8 @@ use crate::domain::session::{
     EndReason, Handle, Host, Launch, LaunchId, Registration, Role, Session, State, Terminal, Title,
     Wrapper,
 };
+use crate::domain::worktree::ports::Store as _;
+use crate::domain::worktree::{self, Owner, Ownership, OwnershipError};
 use crate::git;
 use crate::sqlite::Store;
 
@@ -42,6 +44,28 @@ struct Cli {
 #[derive(Debug, Subcommand, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 enum Command {
+    ClaimWorktree {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        launch_id: Option<String>,
+        #[arg(long)]
+        path: PathBuf,
+    },
+    ReleaseWorktree {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        launch_id: Option<String>,
+        #[arg(long)]
+        path: PathBuf,
+    },
+    Worktrees {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        launch_id: Option<String>,
+    },
     /// Record a tab launched for an agent before the agent's host session exists.
     Launch {
         /// An id the launcher chose, passed on to the session's `register --launch-id`.
@@ -167,6 +191,32 @@ enum Command {
 
 fn owner() -> String {
     Role::OWNER.to_owned()
+}
+
+fn worktree_owner(session: &str, launch: Option<&str>) -> Result<Owner, Failure> {
+    Ok(Owner {
+        session: handle(session)?,
+        launch: launch.map(parse_launch_id).transpose()?,
+    })
+}
+
+fn ownership_view(owned: &Ownership) -> Value {
+    json!({
+        "path": owned.path.as_str(),
+        "session": owned.owner.session.to_string(),
+        "launch_id": owned.owner.launch.as_ref().map(LaunchId::as_str),
+        "claimed_at": owned.claimed_at,
+    })
+}
+
+fn ownership_failure(error: &OwnershipError) -> Failure {
+    let code = match error {
+        OwnershipError::NotRegistered(_) => Code::NotFound,
+        OwnershipError::Binding | OwnershipError::Claimed(_) => Code::Conflict,
+        OwnershipError::InvalidPath => Code::InvalidInput,
+        OwnershipError::Store(_) => Code::Storage,
+    };
+    Failure::new(code, error)
 }
 
 fn closed() -> String {
@@ -301,6 +351,49 @@ async fn dispatch(
 ) -> Result<Value, Failure> {
     let now = environment.now;
     match command {
+        Command::ClaimWorktree {
+            session,
+            launch_id,
+            path,
+        } => {
+            let path = std::fs::canonicalize(absolute(path, environment)?)
+                .map_err(|error| Failure::new(Code::InvalidInput, &error))?;
+            if !path.is_dir() {
+                return Err(Failure::invalid("worktree path must be a directory"));
+            }
+            let path = worktree::Path::new(&path).map_err(|error| ownership_failure(&error))?;
+            let owned = worktree::service::claim(
+                store,
+                &worktree_owner(&session, launch_id.as_deref())?,
+                &path,
+                now,
+            )
+            .await
+            .map_err(|error| ownership_failure(&error))?;
+            Ok(json!({"worktree": ownership_view(&owned)}))
+        }
+        Command::ReleaseWorktree {
+            session,
+            launch_id,
+            path,
+        } => {
+            let path = worktree::Path::new(&path).map_err(|error| ownership_failure(&error))?;
+            worktree::service::release(
+                store,
+                &worktree_owner(&session, launch_id.as_deref())?,
+                &path,
+            )
+            .await
+            .map_err(|error| ownership_failure(&error))?;
+            Ok(json!({"released": true}))
+        }
+        Command::Worktrees { session, launch_id } => {
+            let owned = store
+                .worktrees(&worktree_owner(&session, launch_id.as_deref())?)
+                .await
+                .map_err(|error| storage(&error))?;
+            Ok(json!({"worktrees": owned.iter().map(ownership_view).collect::<Vec<_>>()}))
+        }
         Command::Launch {
             launch_id,
             host,
