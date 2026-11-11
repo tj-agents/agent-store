@@ -1,5 +1,6 @@
 mod entity;
 mod migration;
+mod worktree;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
