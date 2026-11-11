@@ -4,6 +4,7 @@
 mod cli;
 mod launch;
 mod store;
+mod worktree;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

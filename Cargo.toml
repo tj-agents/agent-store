@@ -1,6 +1,6 @@
 [package]
 name = "agent-store"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 description = "A link store between tracker work items and agent host sessions, with a JSON CLI"
