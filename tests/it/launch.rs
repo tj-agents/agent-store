@@ -223,8 +223,11 @@ fn a_launch_records_whether_its_tab_is_open() {
     assert_eq!(opened["launch"]["open"], true);
     assert_eq!(fixture.ok(&["launches"])["launches"][0]["open"], true);
 
-    fixture.ok(&["end", "--launch-id", "tab", "--reason", "exited"]);
-    let closed = fixture.ok(&["set-open", "--launch-id", "tab", "--open", "false"]);
+    let ended = fixture.ok(&["end", "--launch-id", "tab", "--reason", "exited"]);
+    assert_eq!(ended["launch"]["open"], true);
+    let closed = fixture.run_input(r#"{"command": "set-open", "launch_id": "tab", "open": false}"#);
+    assert_eq!(closed.code, 0, "{}", closed.json);
+    let closed = closed.json["data"].clone();
     assert_eq!(closed["launch"]["open"], false);
     assert_eq!(closed["launch"]["state"], "ended");
     assert_eq!(
