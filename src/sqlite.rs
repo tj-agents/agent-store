@@ -144,7 +144,7 @@ impl LinkStore for Store {
             let id = row.id;
             let mut launch = to_launch(&txn, row).await?;
             if change_launch(&mut launch) {
-                save_launch_state(&txn, id, &launch.state).await?;
+                save_launch(&txn, id, &launch).await?;
                 launches.push(launch);
             }
         }
@@ -223,7 +223,7 @@ impl LinkStore for Store {
                         id.as_str()
                     ))
                 })?;
-                save_launch_state(&txn, row_id, &launch.state).await?;
+                save_launch(&txn, row_id, &launch).await?;
                 txn.commit().await.map_err(unavailable)?;
                 Ok(Ok(launch))
             }
@@ -366,17 +366,18 @@ async fn launch_rows(
     query.all(db).await.map_err(unavailable)
 }
 
-async fn save_launch_state(
+async fn save_launch(
     db: &impl ConnectionTrait,
     id: i64,
-    state: &State,
+    launch: &Launch,
 ) -> Result<(), StoreError> {
-    let (closing_requested_at, ended_at, end_reason) = state_columns(state);
+    let (closing_requested_at, ended_at, end_reason) = state_columns(&launch.state);
     launch::Entity::update(launch::ActiveModel {
         id: Set(id),
         closing_requested_at: Set(closing_requested_at),
         ended_at: Set(ended_at),
         end_reason: Set(end_reason),
+        open: Set(launch.open),
         ..Default::default()
     })
     .exec(db)
@@ -574,6 +575,7 @@ fn launch_row(launch: &Launch, reference: Option<i64>) -> launch::ActiveModel {
         closing_requested_at: Set(None),
         ended_at: Set(None),
         end_reason: Set(None),
+        open: Set(launch.open),
     }
 }
 
@@ -631,6 +633,7 @@ async fn to_launch(db: &impl ConnectionTrait, row: launch::Model) -> Result<Laun
             (row.closing_requested_at, row.ended_at, row.end_reason),
             &format_args!("launch {}", row.launch_id),
         )?,
+        open: row.open,
     })
 }
 

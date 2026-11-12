@@ -21,6 +21,7 @@ pub(crate) struct Model {
     pub(crate) closing_requested_at: Option<ChronoDateTimeUtc>,
     pub(crate) ended_at: Option<ChronoDateTimeUtc>,
     pub(crate) end_reason: Option<String>,
+    pub(crate) open: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
