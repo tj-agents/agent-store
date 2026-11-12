@@ -213,3 +213,38 @@ fn launch_failures_have_stable_codes() {
     let twice = fixture.run(&["end", "--launch-id", "dup"]);
     assert_eq!(twice.code, 4, "{}", twice.json);
 }
+
+#[test]
+fn a_launch_records_whether_its_tab_is_open() {
+    let fixture = Fixture::new();
+    assert_eq!(launch(&fixture, "tab", "claude")["open"], false);
+
+    let opened = fixture.ok(&["set-open", "--launch-id", "tab", "--open", "true"]);
+    assert_eq!(opened["launch"]["open"], true);
+    assert_eq!(fixture.ok(&["launches"])["launches"][0]["open"], true);
+
+    let ended = fixture.ok(&["end", "--launch-id", "tab", "--reason", "exited"]);
+    assert_eq!(ended["launch"]["open"], true);
+    let closed = fixture.run_input(r#"{"command": "set-open", "launch_id": "tab", "open": false}"#);
+    assert_eq!(closed.code, 0, "{}", closed.json);
+    let closed = closed.json["data"].clone();
+    assert_eq!(closed["launch"]["open"], false);
+    assert_eq!(closed["launch"]["state"], "ended");
+    assert_eq!(
+        fixture.ok(&["show", "--launch-id", "tab"])["launch"]["open"],
+        false
+    );
+
+    let missing = fixture.run(&["set-open", "--launch-id", "missing", "--open", "true"]);
+    assert_eq!(missing.code, 3, "{}", missing.json);
+    assert_eq!(missing.json["error"]["code"], "not-found");
+}
+
+#[test]
+fn closing_an_item_keeps_its_open_tabs_open() {
+    let fixture = Fixture::new();
+    launch(&fixture, "tab", "claude");
+    fixture.ok(&["set-open", "--launch-id", "tab", "--open", "true"]);
+    let marked = fixture.ok(&["mark-closing", "--item", ITEM]);
+    assert_eq!(marked["launches"][0]["open"], true);
+}

@@ -196,6 +196,8 @@ pub struct Launch {
     pub session: Option<Handle>,
     /// The wrapper's lifecycle: a wrapper stops its agent when its launch or the bound session is closing.
     pub state: State,
+    /// Whether the launch's terminal tab is open, as its wrapper last reported.
+    pub open: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -487,6 +489,7 @@ mod tests {
             created_at: at(0),
             session: None,
             state: State::Active,
+            open: false,
         }
     }
 
