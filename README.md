@@ -83,7 +83,8 @@ A session is addressed by its handle, `host:session-id`, for example `claude:0f3
 A **launch** is a terminal tab started for an agent before the agent's host assigns a session id. The
 process that owns the tab records it under an id of its own choosing and hands that id to the agent; the
 agent's session then registers with `--launch-id` and inherits the launch's title, parent, terminal, wrapper
-and work item. A wrapper stops its agent when its launch or the bound session is `closing`.
+and work item. A wrapper stops its agent when its launch or the bound session is `closing`. A launch's `open`
+records whether its tab is open, as its wrapper last reported; it starts `false`.
 
 | Command | Result `data` |
 |---|---|
@@ -94,6 +95,7 @@ and work item. A wrapper stops its agent when its launch or the bound session is
 | `mark-closing --item REF`, `--session H` or `--launch-id U` | `{sessions, launches}`: those now `closing`. `--item` reaches every session linked to the item and every launch for it. |
 | `sessions --item REF` or `sessions --title T` | `{item, sessions}` or `{title, sessions}`, oldest first |
 | `items` | `{items: [{item, sessions: [{session, role}]}]}` for every item with a linked session |
+| `set-open --launch-id U --open true\|false` | `{launch}`, whatever its state |
 | `launches [--item REF]` | `{launches}`, oldest first |
 | `show H` or `show --launch-id U` | `{session}`, or `{launch, session}` where `session` is `null` until one registers |
 | `claim-worktree --session H [--launch-id U] --path DIR` | `{worktree}`. Claim an existing canonical directory for an active session and its exact active launch binding. |
@@ -128,7 +130,8 @@ A launch object:
   "item": {"ref": "github:github.com/acme/app:461", "provider": "github",
            "scope": "github.com/acme/app", "native_id": "461"},
   "parent": "claude:0f3c", "created_at": "2026-11-08T10:00:00Z", "session": "claude:abc",
-  "state": "active", "closing_requested_at": null, "ended_at": null, "end_reason": null
+  "state": "active", "closing_requested_at": null, "ended_at": null, "end_reason": null,
+  "open": true
 }
 ```
 

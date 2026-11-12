@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use crate::domain::reference::{self, RepositoryScope, WorkItemRef};
 use crate::domain::session::ports::{Item, StoreError};
 use crate::domain::session::service::{
-    self, EndError, LaunchError, LaunchStateError, LinkError, RegisterError, ShowError,
-    ShowLaunchError,
+    self, EndError, LaunchError, LaunchStateError, LinkError, RegisterError, SetOpenError,
+    ShowError, ShowLaunchError,
 };
 use crate::domain::session::{
     EndReason, Handle, Host, Launch, LaunchId, Registration, Role, Session, State, Terminal, Title,
@@ -165,6 +165,13 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         launch_id: Option<String>,
+    },
+    /// Record whether a launch's terminal tab is open.
+    SetOpen {
+        #[arg(long)]
+        launch_id: String,
+        #[arg(long, action = clap::ArgAction::Set)]
+        open: bool,
     },
     /// List every launch, or every launch for a work item, oldest first.
     Launches {
@@ -423,6 +430,7 @@ async fn dispatch(
                 created_at: now,
                 session: None,
                 state: State::Active,
+                open: false,
             };
             let launch = service::launch(store, launch).await.map_err(|e| match e {
                 LaunchError::Exists(e) => Failure::new(Code::Conflict, &e),
@@ -520,6 +528,15 @@ async fn dispatch(
                 }
                 _ => Err(Failure::invalid("pass exactly one of session or launch_id")),
             }
+        }
+        Command::SetOpen { launch_id, open } => {
+            let launch = service::set_open(store, &parse_launch_id(&launch_id)?, open)
+                .await
+                .map_err(|e| match e {
+                    SetOpenError::UnknownLaunch(e) => Failure::new(Code::NotFound, &e),
+                    SetOpenError::Store(e) => storage(&e),
+                })?;
+            Ok(json!({ "launch": LaunchView::from(&launch) }))
         }
         Command::Launches { item } => {
             let item = item.map(|i| resolve_item(&i, environment)).transpose()?;
@@ -788,6 +805,7 @@ struct LaunchView {
     closing_requested_at: Option<DateTime<Utc>>,
     ended_at: Option<DateTime<Utc>>,
     end_reason: Option<String>,
+    open: bool,
 }
 
 impl From<&Launch> for LaunchView {
@@ -812,6 +830,7 @@ impl From<&Launch> for LaunchView {
             closing_requested_at,
             ended_at,
             end_reason,
+            open: launch.open,
         }
     }
 }

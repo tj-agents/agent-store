@@ -77,6 +77,14 @@ pub enum LaunchStateError {
 }
 
 #[derive(Debug, Error)]
+pub enum SetOpenError {
+    #[error(transparent)]
+    UnknownLaunch(UnknownLaunch),
+    #[error(transparent)]
+    Store(StoreError),
+}
+
+#[derive(Debug, Error)]
 pub enum ShowLaunchError {
     #[error(transparent)]
     UnknownLaunch(UnknownLaunch),
@@ -161,6 +169,23 @@ pub async fn end_launch(
         })
         .await
         .map_err(LaunchStateError::Store)?
+}
+
+/// Records whether a launch's tab is open, whatever the launch's state.
+pub async fn set_open(
+    store: &impl LinkStore,
+    id: &LaunchId,
+    open: bool,
+) -> Result<Launch, SetOpenError> {
+    store
+        .update_launch(id, |launch| {
+            let mut launch =
+                launch.ok_or_else(|| SetOpenError::UnknownLaunch(UnknownLaunch(id.clone())))?;
+            launch.open = open;
+            Ok(launch)
+        })
+        .await
+        .map_err(SetOpenError::Store)?
 }
 
 pub async fn launches(
