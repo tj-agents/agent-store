@@ -13,6 +13,7 @@
     "agent@tj-agents": true,
     "base@tj-agents": true,
     "cli@tj-agents": true,
+    "docs@tj-agents": true,
     "engineering@tj-agents": true,
     "personal@tj-agents": true,
     "rust@tj-agents": true,
