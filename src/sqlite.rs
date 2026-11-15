@@ -4,7 +4,7 @@ mod worktree;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::OnConflict;
@@ -71,14 +71,28 @@ impl Store {
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(BUSY_TIMEOUT)
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .map_err(|source| OpenError::Connect {
-                path: path.to_path_buf(),
-                source: DbErr::Conn(sea_orm::RuntimeErr::SqlxError(source.into())),
-            })?;
+        let started = Instant::now();
+        let pool = loop {
+            match SqlitePoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(BUSY_TIMEOUT)
+                .connect_with(options.clone())
+                .await
+            {
+                Ok(pool) => break pool,
+                // WAL startup can bypass the busy handler; on Windows a concurrently mapped
+                // shared-memory file can also refuse truncation. No command has run yet.
+                Err(source) if opening_contended(&source) && started.elapsed() < BUSY_TIMEOUT => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(source) => {
+                    return Err(OpenError::Connect {
+                        path: path.to_path_buf(),
+                        source: DbErr::Conn(sea_orm::RuntimeErr::SqlxError(source.into())),
+                    });
+                }
+            }
+        };
         let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
         migrate(&db).await.map_err(|source| OpenError::Migrate {
             path: path.to_path_buf(),
@@ -96,6 +110,14 @@ impl Store {
             .await
             .map_err(unavailable)
     }
+}
+
+fn opening_contended(error: &sea_orm::sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sea_orm::sqlx::error::DatabaseError::code)
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| code & 0xff == 5 || (cfg!(windows) && code == 1546))
 }
 
 impl LinkStore for Store {
