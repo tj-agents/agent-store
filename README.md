@@ -86,6 +86,9 @@ agent's session then registers with `--launch-id` and inherits the launch's titl
 and work item. A wrapper stops its agent when its launch or the bound session is `closing`. A launch's `open`
 records whether its tab is open, as its wrapper last reported; it starts `false`.
 
+Once a launch is bound, only that same native session can re-register against it. A different session
+receives a conflict without changing either session or the launch, including concurrent first bindings.
+
 | Command | Result `data` |
 |---|---|
 | `launch --launch-id U --host H --title T --cwd DIR --wrapper-pid PID --wrapper-started-at TIME [--worktree DIR] [--item REF] [--terminal-kind K [--terminal-id ID]] [--parent H]` | `{launch}`. A launch id is recorded once. |
