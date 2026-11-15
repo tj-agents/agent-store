@@ -88,12 +88,14 @@ pub trait LinkStore {
         item: Option<&WorkItemRef>,
     ) -> impl Future<Output = Result<Vec<Launch>, StoreError>> + Send;
 
-    /// Saves the session `change` builds from the launch and the stored session (each `None` when absent)
+    /// Saves the session `change` builds from the launch, the requested session and the bound owner
+    /// (each `None` when absent)
     /// and binds it to the launch, as one unit; an `Err` from `change` leaves the store unchanged.
     fn bind<E: Send>(
         &self,
         launch: &LaunchId,
         handle: &Handle,
-        change: impl FnOnce(Option<Launch>, Option<Session>) -> Result<Session, E> + Send,
+        change: impl FnOnce(Option<Launch>, Option<Session>, Option<Session>) -> Result<Session, E>
+        + Send,
     ) -> impl Future<Output = Result<Result<Session, E>, StoreError>> + Send;
 }

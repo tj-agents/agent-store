@@ -6,7 +6,7 @@ use thiserror::Error;
 use super::ports::{Item, LaunchExists, LinkStore, StoreError};
 use super::{
     AlreadyEnded, EndReason, Handle, Host, Launch, LaunchEnded, LaunchId, Registration, Role,
-    Session, Title,
+    Session, State, Title,
 };
 use crate::domain::reference::WorkItemRef;
 
@@ -113,7 +113,7 @@ pub async fn register_launched(
 ) -> Result<Session, RegisterError> {
     let handle = registration.handle.clone();
     store
-        .bind(launch, &handle, |found, existing| {
+        .bind(launch, &handle, |found, existing, owner| {
             let found =
                 found.ok_or_else(|| RegisterError::UnknownLaunch(UnknownLaunch(launch.clone())))?;
             if found.host != *handle.host() {
@@ -125,6 +125,12 @@ pub async fn register_launched(
             }
             if let Some(bound) = &found.session
                 && bound != &handle
+                && !owner.as_ref().is_some_and(|owner| {
+                    owner.handle() == bound
+                        && owner.launch() == Some(launch)
+                        && matches!(owner.state(), State::Ended { .. })
+                        && matches!(found.state, State::Active)
+                })
             {
                 return Err(RegisterError::AlreadyBound {
                     launch: launch.clone(),

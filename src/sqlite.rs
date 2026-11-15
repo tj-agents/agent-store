@@ -246,7 +246,8 @@ impl LinkStore for Store {
         &self,
         launch: &LaunchId,
         handle: &Handle,
-        change: impl FnOnce(Option<Launch>, Option<Session>) -> Result<Session, E> + Send,
+        change: impl FnOnce(Option<Launch>, Option<Session>, Option<Session>) -> Result<Session, E>
+        + Send,
     ) -> Result<Result<Session, E>, StoreError> {
         let txn = self.write().await?;
         let launch_row = find_launch_row(&txn, launch).await?;
@@ -256,7 +257,14 @@ impl LinkStore for Store {
         };
         let row = find_row(&txn, handle).await?;
         let current = load(&txn, row.into_iter().collect()).await?.pop();
-        match change(found, current) {
+        let owner = match found.as_ref().and_then(|launch| launch.session.as_ref()) {
+            Some(bound) => {
+                let row = find_row(&txn, bound).await?;
+                load(&txn, row.into_iter().collect()).await?.pop()
+            }
+            None => None,
+        };
+        match change(found, current, owner) {
             Ok(session) => {
                 let id = save(&txn, &session).await.map_err(unavailable)?;
                 if let Some(row) = launch_row {
