@@ -86,8 +86,9 @@ agent's session then registers with `--launch-id` and inherits the launch's titl
 and work item. A wrapper stops its agent when its launch or the bound session is `closing`. A launch's `open`
 records whether its tab is open, as its wrapper last reported; it starts `false`.
 
-Once a launch is bound, only that same native session can re-register against it. A different session
-receives a conflict without changing either session or the launch, including concurrent first bindings.
+An active owner keeps its launch: another native session receives a conflict without changing either
+session or the launch. An active launch can bind a replacement after its reciprocal owner has ended;
+the old session's history remains unchanged. These checks and concurrent first bindings are atomic.
 
 | Command | Result `data` |
 |---|---|
