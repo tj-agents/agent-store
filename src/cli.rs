@@ -482,6 +482,7 @@ async fn dispatch(
                 .map_err(|e| match e {
                     RegisterError::UnknownLaunch(e) => Failure::new(Code::NotFound, &e),
                     RegisterError::HostMismatch { .. } => Failure::new(Code::InvalidInput, &e),
+                    RegisterError::AlreadyBound { .. } => Failure::new(Code::Conflict, &e),
                     RegisterError::Store(e) => storage(&e),
                 })?,
                 None => service::register(store, registration)
