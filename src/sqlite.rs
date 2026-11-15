@@ -4,7 +4,7 @@ mod worktree;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::OnConflict;
@@ -71,14 +71,28 @@ impl Store {
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(BUSY_TIMEOUT)
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .map_err(|source| OpenError::Connect {
-                path: path.to_path_buf(),
-                source: DbErr::Conn(sea_orm::RuntimeErr::SqlxError(source.into())),
-            })?;
+        let started = Instant::now();
+        let pool = loop {
+            match SqlitePoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(BUSY_TIMEOUT)
+                .connect_with(options.clone())
+                .await
+            {
+                Ok(pool) => break pool,
+                // WAL startup can bypass the busy handler; on Windows a concurrently mapped
+                // shared-memory file can also refuse truncation. No command has run yet.
+                Err(source) if opening_contended(&source) && started.elapsed() < BUSY_TIMEOUT => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(source) => {
+                    return Err(OpenError::Connect {
+                        path: path.to_path_buf(),
+                        source: DbErr::Conn(sea_orm::RuntimeErr::SqlxError(source.into())),
+                    });
+                }
+            }
+        };
         let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
         migrate(&db).await.map_err(|source| OpenError::Migrate {
             path: path.to_path_buf(),
@@ -96,6 +110,14 @@ impl Store {
             .await
             .map_err(unavailable)
     }
+}
+
+fn opening_contended(error: &sea_orm::sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sea_orm::sqlx::error::DatabaseError::code)
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| code & 0xff == 5 || (cfg!(windows) && code == 1546))
 }
 
 impl LinkStore for Store {
@@ -246,7 +268,8 @@ impl LinkStore for Store {
         &self,
         launch: &LaunchId,
         handle: &Handle,
-        change: impl FnOnce(Option<Launch>, Option<Session>) -> Result<Session, E> + Send,
+        change: impl FnOnce(Option<Launch>, Option<Session>, Option<Session>) -> Result<Session, E>
+        + Send,
     ) -> Result<Result<Session, E>, StoreError> {
         let txn = self.write().await?;
         let launch_row = find_launch_row(&txn, launch).await?;
@@ -256,7 +279,14 @@ impl LinkStore for Store {
         };
         let row = find_row(&txn, handle).await?;
         let current = load(&txn, row.into_iter().collect()).await?.pop();
-        match change(found, current) {
+        let owner = match found.as_ref().and_then(|launch| launch.session.as_ref()) {
+            Some(bound) => {
+                let row = find_row(&txn, bound).await?;
+                load(&txn, row.into_iter().collect()).await?.pop()
+            }
+            None => None,
+        };
+        match change(found, current, owner) {
             Ok(session) => {
                 let id = save(&txn, &session).await.map_err(unavailable)?;
                 if let Some(row) = launch_row {
