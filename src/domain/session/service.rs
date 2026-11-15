@@ -62,6 +62,8 @@ pub enum RegisterError {
         expected: Host,
         actual: Host,
     },
+    #[error("launch {} is already bound to {session}", .launch.as_str())]
+    AlreadyBound { launch: LaunchId, session: Handle },
     #[error(transparent)]
     Store(StoreError),
 }
@@ -119,6 +121,14 @@ pub async fn register_launched(
                     launch: launch.clone(),
                     expected: found.host,
                     actual: handle.host().clone(),
+                });
+            }
+            if let Some(bound) = &found.session
+                && bound != &handle
+            {
+                return Err(RegisterError::AlreadyBound {
+                    launch: launch.clone(),
+                    session: bound.clone(),
                 });
             }
             let registration = registration.inherit(&found);

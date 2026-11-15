@@ -141,6 +141,128 @@ fn closing_an_item_reaches_launches_without_a_session() {
 }
 
 #[test]
+fn a_different_native_session_cannot_replace_a_launch_owner() {
+    for host in ["claude", "codex"] {
+        let fixture = Fixture::new();
+        launch(&fixture, "parent-launch", host);
+        let parent = format!("{host}:parent");
+        let child = format!("{host}:background");
+        fixture.ok(&[
+            "register",
+            "--session",
+            &parent,
+            "--cwd",
+            "/parent",
+            "--launch-id",
+            "parent-launch",
+        ]);
+        let before = fixture.ok(&["show", "--launch-id", "parent-launch"]);
+
+        let refused = fixture.run(&[
+            "register",
+            "--session",
+            &child,
+            "--cwd",
+            "/child",
+            "--launch-id",
+            "parent-launch",
+        ]);
+
+        assert_eq!(refused.code, 4, "{}", refused.json);
+        assert_eq!(refused.json["error"]["code"], "conflict");
+        assert_eq!(
+            fixture.ok(&["show", "--launch-id", "parent-launch"]),
+            before
+        );
+        assert_eq!(fixture.run(&["show", &child]).code, 3);
+    }
+}
+
+#[test]
+fn refused_launch_binding_preserves_an_existing_unbound_session() {
+    let fixture = Fixture::new();
+    launch(&fixture, "parent-launch", "codex");
+    fixture.ok(&[
+        "register",
+        "--session",
+        "codex:parent",
+        "--cwd",
+        "/parent",
+        "--launch-id",
+        "parent-launch",
+    ]);
+    let child = fixture.ok(&[
+        "register",
+        "--session",
+        "codex:background",
+        "--cwd",
+        "/original-child",
+        "--title",
+        "child",
+    ]);
+
+    let refused = fixture.run(&[
+        "register",
+        "--session",
+        "codex:background",
+        "--cwd",
+        "/changed-child",
+        "--launch-id",
+        "parent-launch",
+    ]);
+
+    assert_eq!(refused.code, 4, "{}", refused.json);
+    assert_eq!(fixture.ok(&["show", "codex:background"]), child);
+}
+
+#[test]
+fn concurrent_first_bindings_keep_exactly_one_native_owner() {
+    let fixture = Fixture::new();
+    launch(&fixture, "shared-launch", "codex");
+    let gate = std::sync::Barrier::new(3);
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            gate.wait();
+            fixture.run(&[
+                "register",
+                "--session",
+                "codex:first",
+                "--cwd",
+                "/first",
+                "--launch-id",
+                "shared-launch",
+            ])
+        });
+        let second = scope.spawn(|| {
+            gate.wait();
+            fixture.run(&[
+                "register",
+                "--session",
+                "codex:second",
+                "--cwd",
+                "/second",
+                "--launch-id",
+                "shared-launch",
+            ])
+        });
+        gate.wait();
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    let (winner, loser) = match (first.code, second.code) {
+        (0, 4) => ("codex:first", "codex:second"),
+        (4, 0) => ("codex:second", "codex:first"),
+        codes => panic!(
+            "expected one successful binding: {codes:?}; {}, {}",
+            first.json, second.json
+        ),
+    };
+    let bound = fixture.ok(&["show", "--launch-id", "shared-launch"]);
+    assert_eq!(bound["launch"]["session"], winner);
+    assert_eq!(bound["session"]["session"], winner);
+    assert_eq!(fixture.run(&["show", loser]).code, 3);
+}
+
+#[test]
 fn mark_closing_one_launch() {
     let fixture = Fixture::new();
     launch(&fixture, "one", "claude");
