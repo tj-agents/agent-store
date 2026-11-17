@@ -1,6 +1,7 @@
 use std::fmt;
 
 use thiserror::Error;
+use url::Url;
 
 use super::slug::{self, Slug, token};
 
@@ -11,6 +12,7 @@ pub struct Provider(Slug);
 impl Provider {
     pub const GITHUB: &str = "github";
     pub const AZURE_DEVOPS: &str = "azure-devops";
+    pub const URL: &str = "url";
 
     pub fn parse(text: &str) -> Result<Self, slug::ParseError> {
         Slug::parse(text).map(Self)
@@ -25,7 +27,7 @@ impl Provider {
     }
 }
 
-/// Where a provider's ids are unique: `github.com/<owner>/<repo>` or `dev.azure.com/<org>`.
+/// Where a provider's ids are unique, or the scheme for a generic URL reference.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Scope(String);
 
@@ -35,7 +37,7 @@ impl Scope {
     }
 }
 
-/// A work item's id within its scope.
+/// A work item's id within its scope, or everything after a generic URL's scheme and colon.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NativeId(String);
 
@@ -74,9 +76,13 @@ pub enum ParseError {
     ScopeShape { provider: String, scope: String },
     #[error("{provider} ids are positive integers, not `{id}`")]
     NotNumeric { provider: String, id: String },
-    #[error("`{0}` is a bare id, which needs the repository's tracker scope")]
+    #[error(
+        "`{0}` is a bare id, which needs an explicit tracker scope; pass provider:scope:id or a full work item URL"
+    )]
     NeedsRepository(String),
-    #[error("`{0}` is not an id, `#id`, a GitHub or Azure DevOps URL, or `provider:scope:id`")]
+    #[error("invalid absolute work item URL")]
+    Url(#[source] url::ParseError),
+    #[error("`{0}` is not an id, `#id`, an absolute work item URL, or `provider:scope:id`")]
     Unrecognised(String),
 }
 
@@ -119,8 +125,9 @@ impl WorkItemRef {
         })
     }
 
-    /// Parses `461`, `#461`, a GitHub issue or pull request URL, an Azure DevOps work item URL, or
-    /// `provider:scope:id`. A bare id resolves against `repository`.
+    /// Parses an absolute URL or `provider:scope:id`. Known tracker URLs retain their tracker
+    /// identity; other URLs use `url:<scheme>:<remainder>`. A bare `461` or `#461` requires an
+    /// explicitly supplied `repository`; parsing never inspects a code repository.
     pub fn parse(text: &str, repository: Option<&RepositoryScope>) -> Result<Self, ParseError> {
         let text = text.trim();
         let bare = text.strip_prefix('#').unwrap_or(text);
@@ -133,14 +140,23 @@ impl WorkItemRef {
                 bare,
             );
         }
-        if let Some(reference) = parse_url(text) {
-            return reference;
+        if is_network_url(text) {
+            return parse_url(text);
         }
-        if !text.contains("://")
-            && let Some((provider, rest)) = text.split_once(':')
+        if let Some(url) = text.strip_prefix("url:")
+            && is_network_url(url)
+            && Url::parse(url).is_ok()
+            && let Some((scheme, remainder)) = url.split_once(':')
+        {
+            return Self::new(Provider::URL, scheme, remainder);
+        }
+        if let Some((provider, rest)) = text.split_once(':')
             && let Some((scope, id)) = rest.rsplit_once(':')
         {
             return Self::new(provider, scope, id);
+        }
+        if text.contains(':') && !text.starts_with("url:") {
+            return parse_url(text);
         }
         Err(ParseError::Unrecognised(text.to_owned()))
     }
@@ -171,7 +187,17 @@ impl fmt::Display for WorkItemRef {
 }
 
 impl RepositoryScope {
-    /// The tracker scope of a GitHub or Azure DevOps git remote URL, HTTPS or SSH.
+    /// Defines a tracker scope explicitly, independently of the repository's code host.
+    pub fn new(provider: &str, scope: &str) -> Result<Self, ParseError> {
+        let reference = WorkItemRef::new(provider, scope, "1")?;
+        Ok(Self {
+            provider: reference.provider,
+            scope: reference.scope,
+        })
+    }
+
+    /// Derives a scope from a GitHub or Azure DevOps git remote URL, HTTPS or SSH.
+    /// Call only when the caller has independently selected that remote's tracker.
     pub fn from_remote_url(url: &str) -> Option<Self> {
         let (host, path) = split_host_path(url)?;
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -198,34 +224,31 @@ impl RepositoryScope {
     }
 }
 
-fn parse_url(text: &str) -> Option<Result<WorkItemRef, ParseError>> {
-    if !text.contains("://") {
-        return None;
-    }
-    let (host, path) = split_host_path(text)?;
-    let path = path.split(['?', '#']).next().unwrap_or_default();
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    match (host.as_str(), segments.as_slice()) {
-        ("github.com", [owner, repo, "issues" | "pull", id, ..]) => Some(WorkItemRef::new(
-            Provider::GITHUB,
-            &format!("github.com/{owner}/{repo}"),
-            id,
-        )),
-        ("dev.azure.com", [org, _project, "_workitems", "edit", id, ..]) => Some(WorkItemRef::new(
-            Provider::AZURE_DEVOPS,
-            &format!("dev.azure.com/{org}"),
-            id,
-        )),
+fn parse_url(text: &str) -> Result<WorkItemRef, ParseError> {
+    let url = Url::parse(text).map_err(ParseError::Url)?;
+    let segments: Vec<&str> = url.path().split('/').filter(|s| !s.is_empty()).collect();
+    match (url.host_str().unwrap_or_default(), segments.as_slice()) {
+        ("github.com", [owner, repo, "issues" | "pull", id, ..]) => {
+            WorkItemRef::new(Provider::GITHUB, &format!("github.com/{owner}/{repo}"), id)
+        }
+        (
+            "dev.azure.com",
+            [org, "_workitems", "edit", id, ..] | [org, _, "_workitems", "edit", id, ..],
+        ) => WorkItemRef::new(Provider::AZURE_DEVOPS, &format!("dev.azure.com/{org}"), id),
         (host, [.., "_workitems", "edit", id]) if host.ends_with(".visualstudio.com") => {
             let org = host.trim_end_matches(".visualstudio.com");
-            Some(WorkItemRef::new(
-                Provider::AZURE_DEVOPS,
-                &format!("dev.azure.com/{org}"),
-                id,
-            ))
+            WorkItemRef::new(Provider::AZURE_DEVOPS, &format!("dev.azure.com/{org}"), id)
         }
-        _ => None,
+        _ => {
+            let remainder = &url.as_str()[url.scheme().len() + 1..];
+            WorkItemRef::new(Provider::URL, url.scheme(), remainder)
+        }
     }
+}
+
+fn is_network_url(text: &str) -> bool {
+    text.split_once(':')
+        .is_some_and(|(_, remainder)| remainder.starts_with("//"))
 }
 
 /// Splits `scheme://[user@]host/path` or scp-style `user@host:path` into a lowercase host and path.
@@ -270,6 +293,17 @@ mod tests {
     }
 
     #[test]
+    fn bare_ids_use_an_explicit_tracker_scope_independent_of_the_code_host() {
+        let repository = RepositoryScope::new("azure-devops", "dev.azure.com/Contoso").unwrap();
+        assert_eq!(
+            WorkItemRef::parse("#00461", Some(&repository))
+                .unwrap()
+                .to_string(),
+            "azure-devops:dev.azure.com/contoso:461"
+        );
+    }
+
+    #[test]
     fn github_issue_and_pull_urls() {
         assert_eq!(
             parsed("https://github.com/TJ-Agents/Agent/issues/76"),
@@ -283,14 +317,99 @@ mod tests {
 
     #[test]
     fn azure_devops_urls_scope_to_the_organisation() {
-        assert_eq!(
-            parsed("https://dev.azure.com/Contoso/Web/_workitems/edit/12345"),
-            "azure-devops:dev.azure.com/contoso:12345"
-        );
-        assert_eq!(
-            parsed("https://contoso.visualstudio.com/Web/_workitems/edit/7/"),
-            "azure-devops:dev.azure.com/contoso:7"
-        );
+        for url in [
+            "https://dev.azure.com/Contoso/Web/_workitems/edit/00461",
+            "https://dev.azure.com/Contoso/_workitems/edit/461?view=full#discussion",
+            "https://contoso.visualstudio.com/Web/_workitems/edit/461/",
+            "https://contoso.visualstudio.com/_workitems/edit/461",
+        ] {
+            assert_eq!(parsed(url), "azure-devops:dev.azure.com/contoso:461");
+        }
+    }
+
+    #[test]
+    fn unknown_urls_round_trip_through_display_and_stored_fields() {
+        for (input, canonical) in [
+            (
+                "HTTPS://Tracker.Example:443/work/../items/APP-12?view=a:b#comment:2",
+                "https://tracker.example/items/APP-12?view=a:b#comment:2",
+            ),
+            (
+                "https://tracker.example:8443/project%20one/items/APP-12",
+                "https://tracker.example:8443/project%20one/items/APP-12",
+            ),
+            (
+                "http://[::1]:8080/items/12?next=https://example.com/a#details",
+                "http://[::1]:8080/items/12?next=https://example.com/a#details",
+            ),
+            ("tracker://work/items/12", "tracker://work/items/12"),
+            ("https://tracker.example", "https://tracker.example/"),
+            ("mailto:work@example.com", "mailto:work@example.com"),
+            ("custom:ticket-42", "custom:ticket-42"),
+        ] {
+            let reference = WorkItemRef::parse(input, None).unwrap();
+            let (scheme, remainder) = canonical.split_once(':').unwrap();
+            assert_eq!(reference.provider().as_str(), "url");
+            assert_eq!(reference.scope().as_str(), scheme);
+            assert_eq!(reference.native_id().as_str(), remainder);
+            assert_eq!(reference.to_string(), format!("url:{canonical}"));
+            assert_eq!(
+                WorkItemRef::parse(&reference.to_string(), None).unwrap(),
+                reference
+            );
+            assert_eq!(
+                WorkItemRef::new("url", scheme, remainder).unwrap(),
+                reference
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_url_paths_queries_fragments_and_ports_remain_part_of_identity() {
+        let original = WorkItemRef::parse("https://tracker.example/items/ABC", None).unwrap();
+        for other in [
+            "https://tracker.example/items/abc",
+            "https://tracker.example/items/ABC?view=1",
+            "https://tracker.example/items/ABC#comment",
+            "https://tracker.example:8443/items/ABC",
+            "http://tracker.example/items/ABC",
+        ] {
+            assert_ne!(original, WorkItemRef::parse(other, None).unwrap());
+        }
+    }
+
+    #[test]
+    fn unknown_paths_on_known_hosts_are_still_addressable() {
+        for url in [
+            "https://github.com/acme/project/discussions/123",
+            "https://dev.azure.com/acme/Project/_dashboards/dashboard/123",
+        ] {
+            assert_eq!(parsed(url), format!("url:{url}"));
+        }
+    }
+
+    #[test]
+    fn explicit_url_provider_values_keep_their_stored_identity() {
+        for (scope, id) in [
+            ("acme", "APP-12"),
+            ("invalid_scheme", "APP-12"),
+            ("acme:sub", "APP-12"),
+            ("https", "//Tracker.Example:443/items/12?view=a:b"),
+            ("https", "//github.com/Acme/App/issues/00461"),
+            ("https://tracker.example", "APP-12"),
+        ] {
+            let reference = WorkItemRef::new("url", scope, id).unwrap();
+            assert_eq!(reference.provider().as_str(), "url");
+            assert_eq!(reference.scope().as_str(), scope);
+            assert_eq!(reference.native_id().as_str(), id);
+            assert_eq!(
+                WorkItemRef::parse(&reference.to_string(), None).unwrap(),
+                reference
+            );
+        }
+        let reference = WorkItemRef::new("url", "acme", "APP:12").unwrap();
+        assert_eq!(reference.scope().as_str(), "acme");
+        assert_eq!(reference.native_id().as_str(), "APP:12");
     }
 
     #[test]
@@ -303,6 +422,12 @@ mod tests {
             parsed("jira:example.atlassian.net:PROJ-12"),
             "jira:example.atlassian.net:PROJ-12"
         );
+        let reference = WorkItemRef::parse("jira:https://tracker.example:APP-12", None).unwrap();
+        assert_eq!(reference.provider().as_str(), "jira");
+        assert_eq!(reference.scope().as_str(), "https://tracker.example");
+        assert_eq!(reference.native_id().as_str(), "APP-12");
+        assert_eq!(reference.to_string(), "jira:https://tracker.example:APP-12");
+        assert_eq!(parsed("custom:tenant:ticket-42"), "custom:tenant:ticket-42");
     }
 
     #[test]
@@ -333,11 +458,19 @@ mod tests {
 
     #[test]
     fn rejects_unrecognised_text() {
-        assert!(matches!(
-            WorkItemRef::parse("https://example.com/x", Some(&core())),
-            Err(ParseError::Unrecognised(_))
-        ));
         assert!(WorkItemRef::parse("not a ref", None).is_err());
+        for url in [
+            "https://",
+            "https://bad host/items/12",
+            "https://tracker.example:wrong/items/12",
+            "https://[broken/items/12",
+            "1http://tracker.example/items/12",
+            "url:relative/path",
+            "/items/12",
+        ] {
+            assert!(WorkItemRef::parse(url, None).is_err(), "{url}");
+        }
+        assert!(WorkItemRef::new("url", "https", "//bad host/items/12").is_err());
     }
 
     #[test]

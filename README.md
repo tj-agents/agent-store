@@ -50,15 +50,34 @@ Anywhere a command takes `--item`, it accepts:
 
 | Input | Resolves to |
 |---|---|
-| `461` or `#461` | the current directory's `origin` remote: GitHub or Azure DevOps |
 | `https://github.com/acme/app/issues/461` (or `/pull/461`) | `github:github.com/acme/app:461` |
-| `https://dev.azure.com/acme/Web/_workitems/edit/461` | `azure-devops:dev.azure.com/acme:461` |
+| `https://dev.azure.com/acme/Web/_workitems/edit/461` (or `acme/_workitems/edit/461` without a project) | `azure-devops:dev.azure.com/acme:461` |
 | `https://acme.visualstudio.com/Web/_workitems/edit/461` | `azure-devops:dev.azure.com/acme:461` |
+| `https://tracker.example/items/APP-12` | `url:https://tracker.example/items/APP-12` |
+| `url:https://tracker.example/items/APP-12` | the same URL reference |
 | `provider:scope:id`, for example `jira:acme.atlassian.net:APP-12` | as written |
 
 A provider is any lowercase name. For `github` and `azure-devops` the scope must be
 `github.com/<owner>/<repo>` or `dev.azure.com/<org>` (lowercased) and the id a positive integer, stored
-without leading zeros; other providers' scopes and ids are kept as written.
+without leading zeros. Other absolute URLs are validated and normalized
+by the Rust `url` crate: its scope is the scheme and its native id is everything after the scheme's colon.
+Paths, nondefault ports, query strings and fragments remain part of that URL's identity. For example:
+
+```json
+{"ref":"url:https://tracker.example:8443/items/APP-12?view=full#note",
+ "provider":"url","scope":"https",
+ "native_id":"//tracker.example:8443/items/APP-12?view=full#note"}
+```
+
+Other providers' explicit scopes and ids, including existing `url` provider values, are kept as written.
+An explicit `provider:scope:id` takes precedence over an ambiguous opaque URL, splitting scope and id
+at the last colon. A valid `url:<scheme>://...` instead splits at the scheme's colon to preserve the full
+URL remainder. Raw opaque URLs such as `mailto:work@example.com` and `custom:ticket-42` are also accepted.
+Explicit URL wrappers preserve their fields as written; raw URLs receive URL normalization.
+
+The CLI rejects bare `461` and `#461`; pass a full reference or URL. A code repository's remote does not
+select its issue tracker. Library callers may pass an explicit `RepositoryScope` to `WorkItemRef::parse`
+to resolve bare ids, using `RepositoryScope::new(provider, scope)` for their selected tracker.
 
 ## CLI
 
@@ -169,7 +188,7 @@ Instead of flags, pass one request object on stdin (or from a file) with `--inpu
 flag names in `snake_case`; `command` names the subcommand; an unknown field is invalid input:
 
 ```sh
-echo '{"command":"link","session":"codex:019a…","item":"#461","role":"reviewer"}' | agent-store --input -
+echo '{"command":"link","session":"codex:019a…","item":"https://tracker.example/items/APP-12","role":"reviewer"}' | agent-store --input -
 ```
 
 ## Library
