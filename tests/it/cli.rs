@@ -183,12 +183,49 @@ fn re_registering_keeps_a_pending_close_request() {
 }
 
 #[test]
-fn bare_ids_resolve_against_the_origin_remote() {
-    let fixture = Fixture::new();
-    git_repository(fixture.dir.path(), "git@github.com:tj-agents/core.git");
-    register(&fixture, "claude:bare");
-    let linked = fixture.ok(&["link", "--session", "claude:bare", "--item", "#461"]);
-    assert_eq!(linked["session"]["links"][0]["item"]["ref"], ITEM);
+fn bare_ids_never_infer_a_tracker_from_the_code_remote() {
+    for remote in [
+        "git@github.com:acme/app.git",
+        "https://dev.azure.com/acme/Web/_git/app",
+    ] {
+        let fixture = Fixture::new();
+        git_repository(fixture.dir.path(), remote);
+        register(&fixture, "claude:bare");
+        for item in ["461", "#461"] {
+            for args in [
+                vec!["link", "--session", "claude:bare", "--item", item],
+                vec!["sessions", "--item", item],
+                vec!["launches", "--item", item],
+                vec!["mark-closing", "--item", item],
+                vec![
+                    "launch",
+                    "--launch-id",
+                    "bare",
+                    "--host",
+                    "claude",
+                    "--title",
+                    "work",
+                    "--cwd",
+                    "/w",
+                    "--wrapper-pid",
+                    "900",
+                    "--wrapper-started-at",
+                    "2026-11-08T10:00:00Z",
+                    "--item",
+                    item,
+                ],
+            ] {
+                let run = fixture.run(&args);
+                assert_eq!(run.code, 2, "{args:?}: {}", run.json);
+                assert_eq!(run.json["error"]["code"], "invalid-input");
+                let message = run.json["error"]["message"].as_str().unwrap();
+                assert!(message.contains("provider:scope:id"), "{message}");
+                assert!(message.contains("full work item URL"), "{message}");
+            }
+        }
+        assert_eq!(fixture.ok(&["items"])["items"], serde_json::json!([]));
+        assert_eq!(fixture.ok(&["launches"])["launches"], serde_json::json!([]));
+    }
 }
 
 #[test]
@@ -221,7 +258,7 @@ fn failures_are_json_with_stable_codes() {
         bare.json["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("origin")
+            .contains("full work item URL")
     );
 }
 
