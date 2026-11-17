@@ -59,7 +59,7 @@ Anywhere a command takes `--item`, it accepts:
 
 A provider is any lowercase name. For `github` and `azure-devops` the scope must be
 `github.com/<owner>/<repo>` or `dev.azure.com/<org>` (lowercased) and the id a positive integer, stored
-without leading zeros. The reserved provider `url` stores any other absolute URL validated and normalized
+without leading zeros. Other absolute URLs are validated and normalized
 by the Rust `url` crate: its scope is the scheme and its native id is everything after the scheme's colon.
 Paths, nondefault ports, query strings and fragments remain part of that URL's identity. For example:
 
@@ -69,8 +69,11 @@ Paths, nondefault ports, query strings and fragments remain part of that URL's i
  "native_id":"//tracker.example:8443/items/APP-12?view=full#note"}
 ```
 
-Other providers' explicit scopes and ids are kept as written. An explicit `provider:scope:id` takes
-precedence over an ambiguous opaque URL; prefix that URL with `url:` to select URL parsing.
+Other providers' explicit scopes and ids, including existing `url` provider values, are kept as written.
+An explicit `provider:scope:id` takes precedence over an ambiguous opaque URL, splitting scope and id
+at the last colon. A valid `url:<scheme>://...` instead splits at the scheme's colon to preserve the full
+URL remainder. Raw opaque URLs such as `mailto:work@example.com` and `custom:ticket-42` are also accepted.
+Explicit URL wrappers preserve their fields as written; raw URLs receive URL normalization.
 
 The CLI rejects bare `461` and `#461`; pass a full reference or URL. A code repository's remote does not
 select its issue tracker. Library callers may pass an explicit `RepositoryScope` to `WorkItemRef::parse`

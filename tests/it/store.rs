@@ -2,6 +2,48 @@ use std::process::Stdio;
 
 use crate::Fixture;
 
+#[tokio::test]
+async fn existing_explicit_provider_rows_keep_their_identity_when_reopened() {
+    use sea_orm::sqlx::{Connection, SqliteConnection, query, sqlite::SqliteConnectOptions};
+
+    for (provider, scope, native_id) in [
+        ("url", "acme", "APP-12"),
+        ("url", "1invalid", "APP-12"),
+        ("url", "tenant:sub", "APP-12"),
+        ("url", "acme", "APP:12"),
+        ("jira", "https://tracker.example", "APP-12"),
+    ] {
+        let fixture = Fixture::new();
+        fixture.ok(&["register", "--session", "claude:existing", "--cwd", "/w"]);
+        fixture.ok(&[
+            "link",
+            "--session",
+            "claude:existing",
+            "--item",
+            "github:github.com/acme/app:1",
+        ]);
+        // Seed previously valid storage directly, independently of today's reference parser.
+        let options = SqliteConnectOptions::new().filename(fixture.database());
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        query("UPDATE work_item_references SET provider = ?, scope = ?, native_id = ?")
+            .bind(provider)
+            .bind(scope)
+            .bind(native_id)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+
+        let expected = serde_json::json!({
+            "ref": format!("{provider}:{scope}:{native_id}"),
+            "provider": provider, "scope": scope, "native_id": native_id,
+        });
+        let shown = fixture.ok(&["show", "claude:existing"]);
+        assert_eq!(shown["session"]["links"][0]["item"], expected);
+        assert_eq!(fixture.ok(&["items"])["items"][0]["item"], expected);
+    }
+}
+
 #[test]
 fn tracker_urls_round_trip_and_match_sessions_and_launches_after_reopening() {
     for (input, lookup, expected) in [
