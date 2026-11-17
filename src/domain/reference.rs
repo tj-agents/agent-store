@@ -88,9 +88,6 @@ pub enum ParseError {
 
 impl WorkItemRef {
     pub fn new(provider: &str, scope: &str, native_id: &str) -> Result<Self, ParseError> {
-        if provider == Provider::URL {
-            return parse_url(&format!("{scope}:{native_id}"));
-        }
         let provider = Provider::parse(provider).map_err(ParseError::Provider)?;
         let scope = if provider.is_known() {
             scope.to_ascii_lowercase()
@@ -143,18 +140,22 @@ impl WorkItemRef {
                 bare,
             );
         }
-        if let Some(url) = text.strip_prefix("url:") {
-            return parse_url(url);
-        }
-        if text.contains("://") {
+        if is_network_url(text) {
             return parse_url(text);
+        }
+        if let Some(url) = text.strip_prefix("url:")
+            && is_network_url(url)
+            && Url::parse(url).is_ok()
+            && let Some((scheme, remainder)) = url.split_once(':')
+        {
+            return Self::new(Provider::URL, scheme, remainder);
         }
         if let Some((provider, rest)) = text.split_once(':')
             && let Some((scope, id)) = rest.rsplit_once(':')
         {
             return Self::new(provider, scope, id);
         }
-        if text.contains(':') {
+        if text.contains(':') && !text.starts_with("url:") {
             return parse_url(text);
         }
         Err(ParseError::Unrecognised(text.to_owned()))
@@ -240,15 +241,14 @@ fn parse_url(text: &str) -> Result<WorkItemRef, ParseError> {
         }
         _ => {
             let remainder = &url.as_str()[url.scheme().len() + 1..];
-            Ok(WorkItemRef {
-                provider: Provider::parse(Provider::URL).map_err(ParseError::Provider)?,
-                scope: Scope(url.scheme().to_owned()),
-                native_id: token(remainder)
-                    .map(NativeId)
-                    .ok_or_else(|| ParseError::NativeId(remainder.to_owned()))?,
-            })
+            WorkItemRef::new(Provider::URL, url.scheme(), remainder)
         }
     }
+}
+
+fn is_network_url(text: &str) -> bool {
+    text.split_once(':')
+        .is_some_and(|(_, remainder)| remainder.starts_with("//"))
 }
 
 /// Splits `scheme://[user@]host/path` or scp-style `user@host:path` into a lowercase host and path.
@@ -345,6 +345,7 @@ mod tests {
             ("tracker://work/items/12", "tracker://work/items/12"),
             ("https://tracker.example", "https://tracker.example/"),
             ("mailto:work@example.com", "mailto:work@example.com"),
+            ("custom:ticket-42", "custom:ticket-42"),
         ] {
             let reference = WorkItemRef::parse(input, None).unwrap();
             let (scheme, remainder) = canonical.split_once(':').unwrap();
@@ -388,21 +389,27 @@ mod tests {
     }
 
     #[test]
-    fn url_wrapper_cannot_bypass_known_tracker_normalization() {
-        assert_eq!(
-            parsed("url:https://github.com/Acme/App/issues/00461"),
-            "github:github.com/acme/app:461"
-        );
-        assert_eq!(
-            WorkItemRef::new(
-                "url",
-                "https",
-                "//dev.azure.com/Contoso/_workitems/edit/00461"
-            )
-            .unwrap()
-            .to_string(),
-            "azure-devops:dev.azure.com/contoso:461"
-        );
+    fn explicit_url_provider_values_keep_their_stored_identity() {
+        for (scope, id) in [
+            ("acme", "APP-12"),
+            ("invalid_scheme", "APP-12"),
+            ("acme:sub", "APP-12"),
+            ("https", "//Tracker.Example:443/items/12?view=a:b"),
+            ("https", "//github.com/Acme/App/issues/00461"),
+            ("https://tracker.example", "APP-12"),
+        ] {
+            let reference = WorkItemRef::new("url", scope, id).unwrap();
+            assert_eq!(reference.provider().as_str(), "url");
+            assert_eq!(reference.scope().as_str(), scope);
+            assert_eq!(reference.native_id().as_str(), id);
+            assert_eq!(
+                WorkItemRef::parse(&reference.to_string(), None).unwrap(),
+                reference
+            );
+        }
+        let reference = WorkItemRef::new("url", "acme", "APP:12").unwrap();
+        assert_eq!(reference.scope().as_str(), "acme");
+        assert_eq!(reference.native_id().as_str(), "APP:12");
     }
 
     #[test]
@@ -415,6 +422,12 @@ mod tests {
             parsed("jira:example.atlassian.net:PROJ-12"),
             "jira:example.atlassian.net:PROJ-12"
         );
+        let reference = WorkItemRef::parse("jira:https://tracker.example:APP-12", None).unwrap();
+        assert_eq!(reference.provider().as_str(), "jira");
+        assert_eq!(reference.scope().as_str(), "https://tracker.example");
+        assert_eq!(reference.native_id().as_str(), "APP-12");
+        assert_eq!(reference.to_string(), "jira:https://tracker.example:APP-12");
+        assert_eq!(parsed("custom:tenant:ticket-42"), "custom:tenant:ticket-42");
     }
 
     #[test]
