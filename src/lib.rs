@@ -37,5 +37,4 @@
 
 pub mod cli;
 pub mod domain;
-mod git;
 pub mod sqlite;

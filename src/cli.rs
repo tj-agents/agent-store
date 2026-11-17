@@ -9,7 +9,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::domain::reference::{self, RepositoryScope, WorkItemRef};
+use crate::domain::reference::WorkItemRef;
 use crate::domain::session::ports::{Item, StoreError};
 use crate::domain::session::service::{
     self, EndError, LaunchError, LaunchStateError, LinkError, RegisterError, SetOpenError,
@@ -21,7 +21,6 @@ use crate::domain::session::{
 };
 use crate::domain::worktree::ports::Store as _;
 use crate::domain::worktree::{self, Owner, Ownership, OwnershipError};
-use crate::git;
 use crate::sqlite::Store;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -425,7 +424,7 @@ async fn dispatch(
                     pid: wrapper_pid,
                     started_at: wrapper_started_at,
                 },
-                item: item.map(|i| resolve_item(&i, environment)).transpose()?,
+                item: item.map(|i| resolve_item(&i)).transpose()?,
                 parent: parent.as_deref().map(handle).transpose()?,
                 created_at: now,
                 session: None,
@@ -496,7 +495,7 @@ async fn dispatch(
             item,
             role,
         } => {
-            let item = resolve_item(&item, environment)?;
+            let item = resolve_item(&item)?;
             let role = Role::parse(&role).map_err(|e| Failure::new(Code::InvalidInput, &e))?;
             let session = service::link(store, &handle(&session)?, item, role, now)
                 .await
@@ -540,7 +539,7 @@ async fn dispatch(
             Ok(json!({ "launch": LaunchView::from(&launch) }))
         }
         Command::Launches { item } => {
-            let item = item.map(|i| resolve_item(&i, environment)).transpose()?;
+            let item = item.map(|i| resolve_item(&i)).transpose()?;
             let launches = service::launches(store, item.as_ref())
                 .await
                 .map_err(|e| storage(&e))?;
@@ -553,7 +552,7 @@ async fn dispatch(
         } => {
             let (sessions, launches) = match (item, session, launch_id) {
                 (Some(item), None, None) => {
-                    let item = resolve_item(&item, environment)?;
+                    let item = resolve_item(&item)?;
                     service::mark_item_closing(store, &item, now)
                         .await
                         .map_err(|e| storage(&e))?
@@ -584,7 +583,7 @@ async fn dispatch(
         }
         Command::Sessions { item, title } => match (item, title) {
             (Some(item), None) => {
-                let item = resolve_item(&item, environment)?;
+                let item = resolve_item(&item)?;
                 let sessions = service::sessions(store, &item)
                     .await
                     .map_err(|e| storage(&e))?;
@@ -678,24 +677,8 @@ fn terminal(kind: Option<String>, id: Option<String>) -> Result<Option<Terminal>
     }
 }
 
-fn resolve_item(text: &str, environment: &Environment) -> Result<WorkItemRef, Failure> {
-    let parsed = match WorkItemRef::parse(text, None) {
-        Err(reference::ParseError::NeedsRepository(_)) => {
-            let scope = environment
-                .cwd
-                .as_deref()
-                .and_then(git::origin_url)
-                .and_then(|url| RepositoryScope::from_remote_url(&url))
-                .ok_or_else(|| {
-                    Failure::invalid(format!(
-                        "`{text}` is a bare id and the current directory has no GitHub or Azure DevOps `origin` remote; pass provider:scope:id or a URL"
-                    ))
-                })?;
-            WorkItemRef::parse(text, Some(&scope))
-        }
-        parsed => parsed,
-    };
-    parsed.map_err(|e| Failure::new(Code::InvalidInput, &e))
+fn resolve_item(text: &str) -> Result<WorkItemRef, Failure> {
+    WorkItemRef::parse(text, None).map_err(|e| Failure::new(Code::InvalidInput, &e))
 }
 
 fn launch_state_failure(error: LaunchStateError) -> Failure {
