@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use super::ports::{Item, LaunchExists, LinkStore, StoreError};
 use super::{
-    AlreadyEnded, EndReason, Handle, Host, Launch, LaunchEnded, LaunchId, Registration, Role,
-    Session, State, Title,
+    AlreadyEnded, EndReason, Handle, Host, Launch, LaunchEnded, LaunchId, Registration, Resume,
+    Role, Session, State, Title,
 };
 use crate::domain::reference::WorkItemRef;
 
@@ -64,6 +64,27 @@ pub enum RegisterError {
     },
     #[error("launch {} is already bound to {session}", .launch.as_str())]
     AlreadyBound { launch: LaunchId, session: Handle },
+    #[error(transparent)]
+    Store(StoreError),
+}
+
+/// A guarded resume could not use the caller's expected source and destination.
+#[derive(Debug, Error)]
+pub enum ResumeError {
+    #[error("resume requires different source and destination launches")]
+    SameLaunch,
+    #[error(transparent)]
+    NotRegistered(NotRegistered),
+    #[error(transparent)]
+    UnknownLaunch(UnknownLaunch),
+    #[error("resume source launch, session binding or wrapper changed")]
+    SourceChanged,
+    #[error("resume destination launch, session binding or wrapper changed")]
+    DestinationChanged,
+    #[error("a closing source launch or session cannot resume")]
+    Closing,
+    #[error("resume source still owns worktrees after destination binding")]
+    RemainingClaims,
     #[error(transparent)]
     Store(StoreError),
 }
@@ -152,6 +173,80 @@ pub async fn register_launched(
         })
         .await
         .map_err(RegisterError::Store)?
+}
+
+/// Atomically admits an existing session into a new launch and transfers its source claims.
+/// Callers must first prove that the old native session and wrapper have stopped. This operation
+/// only compares stored identities; it neither probes processes nor permits a closing owner.
+pub async fn resume(
+    store: &impl LinkStore,
+    request: &Resume,
+    now: DateTime<Utc>,
+) -> Result<Session, ResumeError> {
+    if request.source == request.destination {
+        return Err(ResumeError::SameLaunch);
+    }
+    store
+        .rebind(
+            &request.handle,
+            &request.source,
+            &request.destination,
+            |source, destination, session, source_has_claims| {
+                let source = source.ok_or_else(|| {
+                    ResumeError::UnknownLaunch(UnknownLaunch(request.source.clone()))
+                })?;
+                let destination = destination.ok_or_else(|| {
+                    ResumeError::UnknownLaunch(UnknownLaunch(request.destination.clone()))
+                })?;
+                let mut session =
+                    registered(session, &request.handle).map_err(ResumeError::NotRegistered)?;
+                if source.id != request.source
+                    || source.host != *request.handle.host()
+                    || source.session.as_ref() != Some(&request.handle)
+                    || source.wrapper != request.source_wrapper
+                    || session.handle() != &request.handle
+                {
+                    return Err(ResumeError::SourceChanged);
+                }
+                if source.state.is_closing() || session.is_closing() {
+                    return Err(ResumeError::Closing);
+                }
+                if destination.id != request.destination
+                    || destination.host != *request.handle.host()
+                    || destination.wrapper != request.destination_wrapper
+                    || destination.state != State::Active
+                {
+                    return Err(ResumeError::DestinationChanged);
+                }
+                if session.launch() == Some(&request.destination) {
+                    if destination.session.as_ref() != Some(&request.handle)
+                        || session.wrapper() != Some(request.destination_wrapper)
+                        || session.state() != &State::Active
+                    {
+                        return Err(ResumeError::DestinationChanged);
+                    }
+                    if source_has_claims {
+                        return Err(ResumeError::RemainingClaims);
+                    }
+                    return Ok(session);
+                }
+                if session.launch() != Some(&request.source)
+                    || session.wrapper() != Some(request.source_wrapper)
+                {
+                    return Err(ResumeError::SourceChanged);
+                }
+                if destination.session.is_some() {
+                    return Err(ResumeError::DestinationChanged);
+                }
+                session.resume_in(&destination);
+                if let Some(item) = destination.item {
+                    session.link_if_absent(item, Role::owner(), now);
+                }
+                Ok(session)
+            },
+        )
+        .await
+        .map_err(ResumeError::Store)?
 }
 
 /// Asks a launch's wrapper to close its agent.

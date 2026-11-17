@@ -102,6 +102,17 @@ pub struct Wrapper {
     pub started_at: DateTime<Utc>,
 }
 
+/// Expected identities for moving one native session from its old launch to a new one.
+/// The caller establishes native and wrapper death; the store only compares recorded identities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Resume {
+    pub handle: Handle,
+    pub source: LaunchId,
+    pub destination: LaunchId,
+    pub source_wrapper: Wrapper,
+    pub destination_wrapper: Wrapper,
+}
+
 /// A session's advisory role on a work item, such as `owner` or `reviewer`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Role(Slug);
@@ -364,6 +375,23 @@ impl Session {
         if let State::Ended { .. } = self.state {
             self.state = State::Active;
         }
+    }
+
+    /// Adopts a validated destination launch's metadata, including an absent parent.
+    /// Keeps this session's original start time and work-item links.
+    fn resume_in(&mut self, launch: &Launch) {
+        self.resume(Registration {
+            handle: self.handle.clone(),
+            cwd: launch.cwd.clone(),
+            worktree: launch.worktree.clone(),
+            terminal: launch.terminal.clone(),
+            wrapper: Some(launch.wrapper),
+            title: Some(launch.title.clone()),
+            parent: launch.parent.clone(),
+            launch: Some(launch.id.clone()),
+            started_at: self.started_at,
+        });
+        self.parent.clone_from(&launch.parent);
     }
 
     pub fn link(&mut self, item: WorkItemRef, role: Role, now: DateTime<Utc>) {

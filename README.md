@@ -113,6 +113,7 @@ the old session's history remains unchanged. These checks and concurrent first b
 |---|---|
 | `launch --launch-id U --host H --title T --cwd DIR --wrapper-pid PID --wrapper-started-at TIME [--worktree DIR] [--item REF] [--terminal-kind K [--terminal-id ID]] [--parent H]` | `{launch}`. A launch id is recorded once. |
 | `register --session H --cwd DIR [--worktree DIR] [--terminal-kind K [--terminal-id ID]] [--wrapper-pid PID --wrapper-started-at TIME] [--title T] [--parent H] [--launch-id U] [--started-at TIME]` | `{session}`. Relative paths resolve against the current directory. Re-registering a session (a resume) updates where it runs and keeps its links, and its title and parent unless new ones are given; an ended session becomes active again, and a pending close request stays. With `--launch-id`, what the other arguments leave unset comes from that launch, the launch's item is linked as `owner` unless already linked, and the launch shows this session. |
+| `resume --session H --from-launch-id OLD --launch-id NEW --from-wrapper-pid OLD_PID --from-wrapper-started-at OLD_TIME --wrapper-pid NEW_PID --wrapper-started-at NEW_TIME` | `{session}`. Compare the recorded source and destination identities, rebind the session and move all of its source worktree claims in one transaction. See [guarded resume](#guarded-resume). |
 | `link --session H --item REF [--role owner]` | `{session}`. Linking again changes only the role. |
 | `end --session H [--reason closed]` or `end --launch-id U [--reason closed]` | `{session}` or `{launch}` |
 | `mark-closing --item REF`, `--session H` or `--launch-id U` | `{sessions, launches}`: those now `closing`. `--item` reaches every session linked to the item and every launch for it. |
@@ -179,6 +180,39 @@ preserves those claims. The caller releases each claim only after its cleanup su
 ownership; callers still establish whether a Git worktree is clean, merged and safe to remove. Existing
 `cwd` and `worktree` fields describe location and do not create ownership claims during an upgrade.
 
+### Guarded resume
+
+Use `resume` when a stopped native conversation continues in a new managed launch:
+
+```sh
+agent-store resume --session codex:abc --from-launch-id run-1 --launch-id run-2 \
+  --from-wrapper-pid 4242 --from-wrapper-started-at 2026-11-08T10:00:00Z \
+  --wrapper-pid 9000 --wrapper-started-at 2026-11-09T11:00:00Z
+```
+
+Before invoking it, the caller must prove that **both the old native session and its wrapper have
+stopped**. Wrapper death alone does not prove native death. The store does not inspect processes, infer
+liveness from timestamps or decide whether recovery is authorized.
+
+The session must still be reciprocally bound to `OLD`, with the expected old wrapper on both the session
+and launch. `NEW` must be a different, existing, active, unbound launch for the same host with the expected
+new wrapper. Neither the source launch nor the session may be closing; an ended source or session is
+allowed after the caller establishes eligibility. A changed identity or closing state returns `conflict`
+without changing anything. Competing resumes to different destinations cannot both succeed.
+
+One write transaction adopts the destination's cwd, worktree location, terminal, wrapper, title and parent
+(including an absent parent), activates the session, links the destination's item as owner if not already
+linked, binds the destination and moves **all and only** claims for `(H, OLD)` to `(H, NEW)`. Claim paths
+and `claimed_at`, existing links and roles, the session's original start time and the source launch's
+history remain unchanged. There is no release/reclaim interval and no filesystem access to claim paths;
+even a missing directory's claim is retained. Other sessions' claims and this session's claims under
+other launches or unmanaged ownership remain unchanged. Ordinary `register` still never transfers claims.
+
+An exact retry succeeds only while the session and active destination remain reciprocally bound with the
+expected new wrapper, the source identity still matches and the source has no remaining claims for this
+session. It does not reactivate an ended destination or repair a partially rebound session. A retry does
+not overwrite session metadata or existing links.
+
 `state` is `active`, `closing` or `ended`. New fields may be added within a schema version; a field is never
 removed or changed in meaning without incrementing `schema_version`.
 
@@ -229,6 +263,12 @@ async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 `domain::worktree::ports::Store` supplies atomic ownership updates and listing. The corresponding
 `service::claim` and `service::release` take an `Owner` and a validated `worktree::Path`. Library callers
 canonicalize an existing directory before constructing a claim path, then retain the stored path for release.
+
+`domain::session::service::resume(&store, &Resume, now)` exposes the same guarded operation to library
+callers. `domain::session::Resume` carries `handle`, `source`, `destination`, `source_wrapper` and
+`destination_wrapper`. Its `LinkStore::rebind` port reads the identities and source-claim presence, then
+saves the admitted session, destination binding and claim changes in one transaction. Native and wrapper
+liveness verification belongs to the caller of this API as well.
 
 ## Development
 
