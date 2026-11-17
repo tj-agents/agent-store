@@ -12,12 +12,12 @@ use serde_json::{Value, json};
 use crate::domain::reference::WorkItemRef;
 use crate::domain::session::ports::{Item, StoreError};
 use crate::domain::session::service::{
-    self, EndError, LaunchError, LaunchStateError, LinkError, RegisterError, SetOpenError,
-    ShowError, ShowLaunchError,
+    self, EndError, LaunchError, LaunchStateError, LinkError, RegisterError, ResumeError,
+    SetOpenError, ShowError, ShowLaunchError,
 };
 use crate::domain::session::{
-    EndReason, Handle, Host, Launch, LaunchId, Registration, Role, Session, State, Terminal, Title,
-    Wrapper,
+    EndReason, Handle, Host, Launch, LaunchId, Registration, Resume, Role, Session, State,
+    Terminal, Title, Wrapper,
 };
 use crate::domain::worktree::ports::Store as _;
 use crate::domain::worktree::{self, Owner, Ownership, OwnershipError};
@@ -43,6 +43,23 @@ struct Cli {
 #[derive(Debug, Subcommand, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 enum Command {
+    /// Rebind a stopped native session to a new launch and atomically move its source worktree claims.
+    Resume {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        from_launch_id: String,
+        #[arg(long)]
+        launch_id: String,
+        #[arg(long)]
+        from_wrapper_pid: u32,
+        #[arg(long)]
+        from_wrapper_started_at: DateTime<Utc>,
+        #[arg(long)]
+        wrapper_pid: u32,
+        #[arg(long)]
+        wrapper_started_at: DateTime<Utc>,
+    },
     ClaimWorktree {
         #[arg(long)]
         session: String,
@@ -357,6 +374,44 @@ async fn dispatch(
 ) -> Result<Value, Failure> {
     let now = environment.now;
     match command {
+        Command::Resume {
+            session,
+            from_launch_id,
+            launch_id,
+            from_wrapper_pid,
+            from_wrapper_started_at,
+            wrapper_pid,
+            wrapper_started_at,
+        } => {
+            let request = Resume {
+                handle: handle(&session)?,
+                source: parse_launch_id(&from_launch_id)?,
+                destination: parse_launch_id(&launch_id)?,
+                source_wrapper: Wrapper {
+                    pid: from_wrapper_pid,
+                    started_at: from_wrapper_started_at,
+                },
+                destination_wrapper: Wrapper {
+                    pid: wrapper_pid,
+                    started_at: wrapper_started_at,
+                },
+            };
+            let session =
+                service::resume(store, &request, now)
+                    .await
+                    .map_err(|error| match error {
+                        ResumeError::SameLaunch => Failure::new(Code::InvalidInput, &error),
+                        ResumeError::NotRegistered(_) | ResumeError::UnknownLaunch(_) => {
+                            Failure::new(Code::NotFound, &error)
+                        }
+                        ResumeError::SourceChanged
+                        | ResumeError::DestinationChanged
+                        | ResumeError::Closing
+                        | ResumeError::RemainingClaims => Failure::new(Code::Conflict, &error),
+                        ResumeError::Store(error) => storage(&error),
+                    })?;
+            Ok(json!({"session": SessionView::from(&session)}))
+        }
         Command::ClaimWorktree {
             session,
             launch_id,

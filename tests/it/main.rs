@@ -3,6 +3,7 @@
 
 mod cli;
 mod launch;
+mod resume;
 mod store;
 mod worktree;
 

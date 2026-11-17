@@ -98,4 +98,16 @@ pub trait LinkStore {
         change: impl FnOnce(Option<Launch>, Option<Session>, Option<Session>) -> Result<Session, E>
         + Send,
     ) -> impl Future<Output = Result<Result<Session, E>, StoreError>> + Send;
+
+    /// Reads both launches, the session and whether it has source claims under one write lock.
+    /// Saves the validated session, binds the destination and moves only this session's source
+    /// claims without changing their paths or timestamps. Any failure leaves all records unchanged.
+    fn rebind<E: Send>(
+        &self,
+        handle: &Handle,
+        source: &LaunchId,
+        destination: &LaunchId,
+        change: impl FnOnce(Option<Launch>, Option<Launch>, Option<Session>, bool) -> Result<Session, E>
+        + Send,
+    ) -> impl Future<Output = Result<Result<Session, E>, StoreError>> + Send;
 }

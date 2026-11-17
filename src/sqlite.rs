@@ -24,7 +24,7 @@ use crate::domain::session::{
     EndReason, Handle, Host, Launch, LaunchId, Link, Registration, Role, Session, State, Terminal,
     Title, Wrapper,
 };
-use entity::{launch, session, session_link, work_item_reference};
+use entity::{launch, session, session_link, work_item_reference, worktree_ownership};
 use migration::Migrator;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -307,6 +307,73 @@ impl LinkStore for Store {
                 Ok(Err(error))
             }
         }
+    }
+
+    async fn rebind<E: Send>(
+        &self,
+        handle: &Handle,
+        source: &LaunchId,
+        destination: &LaunchId,
+        change: impl FnOnce(Option<Launch>, Option<Launch>, Option<Session>, bool) -> Result<Session, E>
+        + Send,
+    ) -> Result<Result<Session, E>, StoreError> {
+        let txn = self.write().await?;
+        let source_launch = match find_launch_row(&txn, source).await? {
+            Some(row) => Some(to_launch(&txn, row).await?),
+            None => None,
+        };
+        let destination_row = find_launch_row(&txn, destination).await?;
+        let destination_launch = match destination_row.clone() {
+            Some(row) => Some(to_launch(&txn, row).await?),
+            None => None,
+        };
+        let row = find_row(&txn, handle).await?;
+        let source_has_claims = match &row {
+            Some(row) => worktree_ownership::Entity::find()
+                .filter(worktree_ownership::Column::SessionId.eq(row.id))
+                .filter(worktree_ownership::Column::LaunchId.eq(source.as_str()))
+                .one(&txn)
+                .await
+                .map_err(unavailable)?
+                .is_some(),
+            None => false,
+        };
+        let current = load(&txn, row.into_iter().collect()).await?.pop();
+        let session = match change(
+            source_launch,
+            destination_launch,
+            current,
+            source_has_claims,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                txn.rollback().await.map_err(unavailable)?;
+                return Ok(Err(error));
+            }
+        };
+        let destination_row =
+            destination_row.ok_or_else(|| corrupt("resume has no destination launch".into()))?;
+        let id = save(&txn, &session).await.map_err(unavailable)?;
+        launch::Entity::update(launch::ActiveModel {
+            id: Set(destination_row.id),
+            session_id: Set(Some(id)),
+            ..Default::default()
+        })
+        .exec(&txn)
+        .await
+        .map_err(unavailable)?;
+        worktree_ownership::Entity::update_many()
+            .set(worktree_ownership::ActiveModel {
+                launch_id: Set(Some(destination.as_str().to_owned())),
+                ..Default::default()
+            })
+            .filter(worktree_ownership::Column::SessionId.eq(id))
+            .filter(worktree_ownership::Column::LaunchId.eq(source.as_str()))
+            .exec(&txn)
+            .await
+            .map_err(unavailable)?;
+        txn.commit().await.map_err(unavailable)?;
+        Ok(Ok(session))
     }
 
     async fn items(&self) -> Result<Vec<Item>, StoreError> {
