@@ -24,7 +24,9 @@ use crate::domain::session::{
     EndReason, Handle, Host, Launch, LaunchId, Link, Registration, Role, Session, State, Terminal,
     Title, Wrapper,
 };
-use entity::{launch, session, session_link, work_item_reference};
+use entity::{
+    launch, session, session_link, session_resume, work_item_reference, worktree_ownership,
+};
 use migration::Migrator;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -309,6 +311,102 @@ impl LinkStore for Store {
         }
     }
 
+    async fn rebind<E: Send>(
+        &self,
+        handle: &Handle,
+        source: &LaunchId,
+        destination: &LaunchId,
+        change: impl FnOnce(
+            Option<Launch>,
+            Option<Launch>,
+            Option<Session>,
+            bool,
+            bool,
+        ) -> Result<Session, E>
+        + Send,
+    ) -> Result<Result<Session, E>, StoreError> {
+        let txn = self.write().await?;
+        let source_launch = match find_launch_row(&txn, source).await? {
+            Some(row) => Some(to_launch(&txn, row).await?),
+            None => None,
+        };
+        let destination_row = find_launch_row(&txn, destination).await?;
+        let destination_launch = match destination_row.clone() {
+            Some(row) => Some(to_launch(&txn, row).await?),
+            None => None,
+        };
+        let row = find_row(&txn, handle).await?;
+        let source_has_claims = match &row {
+            Some(row) => worktree_ownership::Entity::find()
+                .filter(worktree_ownership::Column::SessionId.eq(row.id))
+                .filter(worktree_ownership::Column::LaunchId.eq(source.as_str()))
+                .one(&txn)
+                .await
+                .map_err(unavailable)?
+                .is_some(),
+            None => false,
+        };
+        let admitted = match &row {
+            Some(row) => session_resume::Entity::find_by_id((
+                row.id,
+                source.as_str().to_owned(),
+                destination.as_str().to_owned(),
+            ))
+            .one(&txn)
+            .await
+            .map_err(unavailable)?
+            .is_some(),
+            None => false,
+        };
+        let current = load(&txn, row.into_iter().collect()).await?.pop();
+        let session = match change(
+            source_launch,
+            destination_launch,
+            current,
+            source_has_claims,
+            admitted,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                txn.rollback().await.map_err(unavailable)?;
+                return Ok(Err(error));
+            }
+        };
+        let destination_row =
+            destination_row.ok_or_else(|| corrupt("resume has no destination launch".into()))?;
+        let id = save(&txn, &session).await.map_err(unavailable)?;
+        launch::Entity::update(launch::ActiveModel {
+            id: Set(destination_row.id),
+            session_id: Set(Some(id)),
+            ..Default::default()
+        })
+        .exec(&txn)
+        .await
+        .map_err(unavailable)?;
+        if !admitted {
+            session_resume::Entity::insert(session_resume::ActiveModel {
+                session_id: Set(id),
+                source_launch_id: Set(source.as_str().to_owned()),
+                destination_launch_id: Set(destination.as_str().to_owned()),
+            })
+            .exec(&txn)
+            .await
+            .map_err(unavailable)?;
+        }
+        worktree_ownership::Entity::update_many()
+            .set(worktree_ownership::ActiveModel {
+                launch_id: Set(Some(destination.as_str().to_owned())),
+                ..Default::default()
+            })
+            .filter(worktree_ownership::Column::SessionId.eq(id))
+            .filter(worktree_ownership::Column::LaunchId.eq(source.as_str()))
+            .exec(&txn)
+            .await
+            .map_err(unavailable)?;
+        txn.commit().await.map_err(unavailable)?;
+        Ok(Ok(session))
+    }
+
     async fn items(&self) -> Result<Vec<Item>, StoreError> {
         let rows = work_item_reference::Entity::find()
             .find_with_related(session_link::Entity)
@@ -471,6 +569,11 @@ async fn load(
 }
 
 async fn save(db: &impl ConnectionTrait, session: &Session) -> Result<i64, DbErr> {
+    let previous = session::Entity::find()
+        .filter(session::Column::Host.eq(session.handle().host().as_str()))
+        .filter(session::Column::NativeId.eq(session.handle().native_id()))
+        .one(db)
+        .await?;
     let row = session::Entity::insert(session_row(session))
         .on_conflict(
             OnConflict::columns([session::Column::Host, session::Column::NativeId])
@@ -492,6 +595,22 @@ async fn save(db: &impl ConnectionTrait, session: &Session) -> Result<i64, DbErr
         )
         .exec_with_returning(db)
         .await?;
+    // A receipt authorizes only the uninterrupted active binding that created it. All session
+    // writes use this path, including ordinary registration, library updates and guarded rebinds.
+    if let Some(previous) = previous
+        && (previous.launch_id != row.launch_id
+            || previous.wrapper_pid != row.wrapper_pid
+            || previous.wrapper_started_at != row.wrapper_started_at
+            || previous.closing_requested_at.is_some()
+            || previous.ended_at.is_some()
+            || row.closing_requested_at.is_some()
+            || row.ended_at.is_some())
+    {
+        session_resume::Entity::delete_many()
+            .filter(session_resume::Column::SessionId.eq(row.id))
+            .exec(db)
+            .await?;
+    }
     for link in session.links() {
         let reference = reference_id(db, &link.item).await?;
         session_link::Entity::insert(session_link::ActiveModel {

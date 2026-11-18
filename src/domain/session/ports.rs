@@ -26,7 +26,9 @@ pub struct Item {
 }
 
 /// Persists sessions with their links, and launches. Each update reads, changes and saves as one unit, so
-/// concurrent writers never undo each other.
+/// concurrent writers never undo each other. Every session write invalidates that session's admission
+/// receipts when its launch or wrapper changes, or its active state is interrupted. Other metadata and
+/// link changes preserve receipts. A successful rebind records admission for the new binding.
 pub trait LinkStore {
     fn find(
         &self,
@@ -96,6 +98,25 @@ pub trait LinkStore {
         launch: &LaunchId,
         handle: &Handle,
         change: impl FnOnce(Option<Launch>, Option<Session>, Option<Session>) -> Result<Session, E>
+        + Send,
+    ) -> impl Future<Output = Result<Result<Session, E>, StoreError>> + Send;
+
+    /// Reads both launches, the session, whether it has source claims and whether this exact
+    /// session/source/destination resume was admitted, under one write lock. Saves the validated
+    /// session, binds the destination, records admission and moves only this session's source claims
+    /// without changing their paths or timestamps. Any failure leaves all records unchanged.
+    fn rebind<E: Send>(
+        &self,
+        handle: &Handle,
+        source: &LaunchId,
+        destination: &LaunchId,
+        change: impl FnOnce(
+            Option<Launch>,
+            Option<Launch>,
+            Option<Session>,
+            bool,
+            bool,
+        ) -> Result<Session, E>
         + Send,
     ) -> impl Future<Output = Result<Result<Session, E>, StoreError>> + Send;
 }
