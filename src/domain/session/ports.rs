@@ -26,7 +26,9 @@ pub struct Item {
 }
 
 /// Persists sessions with their links, and launches. Each update reads, changes and saves as one unit, so
-/// concurrent writers never undo each other.
+/// concurrent writers never undo each other. Every session write invalidates that session's admission
+/// receipts when its launch or wrapper changes, or its active state is interrupted. Other metadata and
+/// link changes preserve receipts. A successful rebind records admission for the new binding.
 pub trait LinkStore {
     fn find(
         &self,

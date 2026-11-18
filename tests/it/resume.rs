@@ -368,6 +368,172 @@ fn ordinary_registration_without_claims_cannot_masquerade_as_a_resume_retry() {
 }
 
 #[test]
+fn ordinary_rebinding_invalidates_admission_without_changing_claims() {
+    for host in ["claude", "codex"] {
+        for with_claims in [false, true] {
+            let fixture = Fixture::new();
+            let handle = format!("{host}:owner");
+            launch(&fixture, "source", host);
+            launch(&fixture, "destination", host);
+            register(&fixture, &handle, Some("source"));
+            if with_claims {
+                claim(&fixture, &handle, Some("source"), "owned");
+            }
+            input(&fixture, &request(&handle, "destination"));
+            let owned = claims(&fixture, &handle, Some("destination"));
+            register(&fixture, &handle, Some("source"));
+            register(&fixture, &handle, Some("destination"));
+            let before = snapshot(&fixture);
+            let run = fixture.run_input(&request(&handle, "destination").to_string());
+            assert_eq!(run.code, 4, "{host}/{with_claims}: {}", run.json);
+            assert_eq!(run.json["error"]["code"], "conflict");
+            assert_eq!(snapshot(&fixture), before);
+            assert_eq!(claims(&fixture, &handle, Some("destination")), owned);
+            assert_eq!(claims(&fixture, &handle, Some("source")), json!([]));
+        }
+    }
+}
+
+#[test]
+fn same_binding_registration_and_metadata_updates_preserve_resume_retries() {
+    for managed in [false, true] {
+        let fixture = seed();
+        input(&fixture, &request("codex:owner", "destination"));
+        input(
+            &fixture,
+            &json!({
+                "command": "register", "session": "codex:owner",
+                "launch_id": if managed { Some("destination") } else { None },
+                "cwd": fixture.path("updated cwd"), "worktree": fixture.path("updated worktree"),
+                "wrapper_pid": 202, "wrapper_started_at": NEW_TIME,
+                "title": "updated", "parent": "claude:updated-parent",
+                "terminal_kind": "tmux", "terminal_id": "updated",
+            }),
+        );
+        fixture.ok(&[
+            "link",
+            "--session",
+            "codex:owner",
+            "--item",
+            NEW_ITEM,
+            "--role",
+            "reviewer",
+        ]);
+        // The source is historical; its wrapper ending does not replace the current binding.
+        fixture.ok(&["end", "--launch-id", "source"]);
+        let before = snapshot(&fixture);
+        let resumed = input(&fixture, &request("codex:owner", "destination"));
+        assert_eq!(resumed, fixture.ok(&["show", "codex:owner"]));
+        assert_eq!(snapshot(&fixture), before);
+    }
+}
+
+#[test]
+fn restored_wrapper_or_reactivated_session_cannot_reuse_an_old_admission() {
+    for interruption in ["pid", "started-at", "no-wrapper", "ended", "closing"] {
+        let fixture = seed();
+        input(&fixture, &request("codex:owner", "destination"));
+        match interruption {
+            "ended" => {
+                fixture.ok(&["end", "--session", "codex:owner"]);
+            }
+            "closing" => {
+                fixture.ok(&["mark-closing", "--session", "codex:owner"]);
+                fixture.ok(&["end", "--session", "codex:owner"]);
+            }
+            _ => {
+                // Without --launch-id this exercises the ordinary library update path.
+                let mut registration = json!({
+                    "command": "register", "session": "codex:owner", "cwd": fixture.path("other"),
+                });
+                if interruption != "no-wrapper" {
+                    registration["wrapper_pid"] =
+                        json!(if interruption == "pid" { 999 } else { 202 });
+                    registration["wrapper_started_at"] = json!(if interruption == "started-at" {
+                        OLD_TIME
+                    } else {
+                        NEW_TIME
+                    });
+                }
+                input(&fixture, &registration);
+            }
+        }
+        register(&fixture, "codex:owner", Some("destination"));
+        let before = snapshot(&fixture);
+        let run = fixture.run_input(&request("codex:owner", "destination").to_string());
+        assert_eq!(run.code, 4, "{interruption}: {}", run.json);
+        assert_eq!(snapshot(&fixture), before);
+    }
+}
+
+#[test]
+fn a_later_guarded_resume_replaces_only_its_sessions_admission() {
+    let fixture = seed();
+    input(&fixture, &request("codex:owner", "destination"));
+    for id in ["foreign-source", "foreign-destination", "later"] {
+        launch(&fixture, id, "codex");
+    }
+    register(&fixture, "codex:foreign", Some("foreign-source"));
+    let mut foreign = request("codex:foreign", "foreign-destination");
+    foreign["from_launch_id"] = json!("foreign-source");
+    foreign["from_wrapper_pid"] = json!(202);
+    foreign["from_wrapper_started_at"] = json!(NEW_TIME);
+    let foreign_admitted = input(&fixture, &foreign);
+    let mut later = request("codex:owner", "later");
+    later["from_launch_id"] = json!("destination");
+    later["from_wrapper_pid"] = json!(202);
+    later["from_wrapper_started_at"] = json!(NEW_TIME);
+    let admitted = input(&fixture, &later);
+    assert_eq!(input(&fixture, &later), admitted);
+    register(&fixture, "codex:owner", Some("destination"));
+    let before = snapshot(&fixture);
+    let run = fixture.run_input(&request("codex:owner", "destination").to_string());
+    assert_eq!(run.code, 4, "{}", run.json);
+    assert_eq!(snapshot(&fixture), before);
+    assert_eq!(input(&fixture, &foreign), foreign_admitted);
+    assert_eq!(
+        claims(&fixture, "codex:owner", Some("later"))
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn failed_binding_replacement_restores_the_admission_receipt() {
+    let fixture = seed();
+    let admitted = input(&fixture, &request("codex:owner", "destination"));
+    let before = snapshot(&fixture);
+    let options = SqliteConnectOptions::new().filename(fixture.database());
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    query(
+        "CREATE TRIGGER refuse_rebinding BEFORE UPDATE OF session_id ON launches
+        WHEN NEW.launch_id = 'source'
+        BEGIN SELECT RAISE(ABORT, 'injected binding failure'); END",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    let run = fixture.run(&[
+        "register",
+        "--session",
+        "codex:owner",
+        "--cwd",
+        "changed",
+        "--launch-id",
+        "source",
+    ]);
+    assert_eq!(run.code, 5, "{}", run.json);
+    assert_eq!(snapshot(&fixture), before);
+    assert_eq!(receipt_count(&mut connection).await, 1);
+    assert_eq!(
+        input(&fixture, &request("codex:owner", "destination")),
+        admitted
+    );
+}
+
+#[test]
 fn resume_receipts_apply_only_to_the_exact_session_source_and_destination() {
     for difference in ["session", "source", "destination"] {
         let fixture = seed();

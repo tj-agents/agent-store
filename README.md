@@ -214,6 +214,12 @@ reciprocally bound with the expected new wrapper, the source identity still matc
 no remaining claims for this session. Ordinary `register` cannot create this receipt, even when it
 produces identical metadata and the source has no claims. It does not reactivate an ended destination
 or repair a partially rebound session. A retry does not overwrite session metadata or existing links.
+Receipts apply only to an uninterrupted active binding. Changing the session's launch or wrapper, or
+closing or ending the session, invalidates its receipts in the same transaction. Returning to an earlier
+binding through ordinary registration cannot restore them. Registration that retains the same active
+launch and wrapper preserves the receipt, including updates to location, title, parent or links. A
+subsequent guarded resume replaces the previous admission with its own receipt; other sessions' receipts
+and all worktree claims are unaffected by invalidation.
 Upgrading creates no receipts for existing bindings; those bindings cannot establish a prior admission.
 
 `state` is `active`, `closing` or `ended`. New fields may be added within a schema version; a field is never
