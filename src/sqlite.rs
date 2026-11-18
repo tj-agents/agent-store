@@ -569,6 +569,11 @@ async fn load(
 }
 
 async fn save(db: &impl ConnectionTrait, session: &Session) -> Result<i64, DbErr> {
+    let previous = session::Entity::find()
+        .filter(session::Column::Host.eq(session.handle().host().as_str()))
+        .filter(session::Column::NativeId.eq(session.handle().native_id()))
+        .one(db)
+        .await?;
     let row = session::Entity::insert(session_row(session))
         .on_conflict(
             OnConflict::columns([session::Column::Host, session::Column::NativeId])
@@ -590,6 +595,22 @@ async fn save(db: &impl ConnectionTrait, session: &Session) -> Result<i64, DbErr
         )
         .exec_with_returning(db)
         .await?;
+    // A receipt authorizes only the uninterrupted active binding that created it. All session
+    // writes use this path, including ordinary registration, library updates and guarded rebinds.
+    if let Some(previous) = previous
+        && (previous.launch_id != row.launch_id
+            || previous.wrapper_pid != row.wrapper_pid
+            || previous.wrapper_started_at != row.wrapper_started_at
+            || previous.closing_requested_at.is_some()
+            || previous.ended_at.is_some()
+            || row.closing_requested_at.is_some()
+            || row.ended_at.is_some())
+    {
+        session_resume::Entity::delete_many()
+            .filter(session_resume::Column::SessionId.eq(row.id))
+            .exec(db)
+            .await?;
+    }
     for link in session.links() {
         let reference = reference_id(db, &link.item).await?;
         session_link::Entity::insert(session_link::ActiveModel {
