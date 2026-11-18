@@ -24,7 +24,9 @@ use crate::domain::session::{
     EndReason, Handle, Host, Launch, LaunchId, Link, Registration, Role, Session, State, Terminal,
     Title, Wrapper,
 };
-use entity::{launch, session, session_link, work_item_reference, worktree_ownership};
+use entity::{
+    launch, session, session_link, session_resume, work_item_reference, worktree_ownership,
+};
 use migration::Migrator;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -314,7 +316,13 @@ impl LinkStore for Store {
         handle: &Handle,
         source: &LaunchId,
         destination: &LaunchId,
-        change: impl FnOnce(Option<Launch>, Option<Launch>, Option<Session>, bool) -> Result<Session, E>
+        change: impl FnOnce(
+            Option<Launch>,
+            Option<Launch>,
+            Option<Session>,
+            bool,
+            bool,
+        ) -> Result<Session, E>
         + Send,
     ) -> Result<Result<Session, E>, StoreError> {
         let txn = self.write().await?;
@@ -338,12 +346,25 @@ impl LinkStore for Store {
                 .is_some(),
             None => false,
         };
+        let admitted = match &row {
+            Some(row) => session_resume::Entity::find_by_id((
+                row.id,
+                source.as_str().to_owned(),
+                destination.as_str().to_owned(),
+            ))
+            .one(&txn)
+            .await
+            .map_err(unavailable)?
+            .is_some(),
+            None => false,
+        };
         let current = load(&txn, row.into_iter().collect()).await?.pop();
         let session = match change(
             source_launch,
             destination_launch,
             current,
             source_has_claims,
+            admitted,
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -362,6 +383,16 @@ impl LinkStore for Store {
         .exec(&txn)
         .await
         .map_err(unavailable)?;
+        if !admitted {
+            session_resume::Entity::insert(session_resume::ActiveModel {
+                session_id: Set(id),
+                source_launch_id: Set(source.as_str().to_owned()),
+                destination_launch_id: Set(destination.as_str().to_owned()),
+            })
+            .exec(&txn)
+            .await
+            .map_err(unavailable)?;
+        }
         worktree_ownership::Entity::update_many()
             .set(worktree_ownership::ActiveModel {
                 launch_id: Set(Some(destination.as_str().to_owned())),

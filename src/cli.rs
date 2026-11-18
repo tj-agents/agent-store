@@ -407,7 +407,8 @@ async fn dispatch(
                         ResumeError::SourceChanged
                         | ResumeError::DestinationChanged
                         | ResumeError::Closing
-                        | ResumeError::RemainingClaims => Failure::new(Code::Conflict, &error),
+                        | ResumeError::RemainingClaims
+                        | ResumeError::NotAdmitted => Failure::new(Code::Conflict, &error),
                         ResumeError::Store(error) => storage(&error),
                     })?;
             Ok(json!({"session": SessionView::from(&session)}))
