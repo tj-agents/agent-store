@@ -208,10 +208,13 @@ history remain unchanged. There is no release/reclaim interval and no filesystem
 even a missing directory's claim is retained. Other sessions' claims and this session's claims under
 other launches or unmanaged ownership remain unchanged. Ordinary `register` still never transfers claims.
 
-An exact retry succeeds only while the session and active destination remain reciprocally bound with the
-expected new wrapper, the source identity still matches and the source has no remaining claims for this
-session. It does not reactivate an ended destination or repair a partially rebound session. A retry does
-not overwrite session metadata or existing links.
+An exact retry also requires a durable admission receipt for that session, source and destination,
+written in the same transaction. It succeeds only while the session and active destination remain
+reciprocally bound with the expected new wrapper, the source identity still matches and the source has
+no remaining claims for this session. Ordinary `register` cannot create this receipt, even when it
+produces identical metadata and the source has no claims. It does not reactivate an ended destination
+or repair a partially rebound session. A retry does not overwrite session metadata or existing links.
+Upgrading creates no receipts for existing bindings; those bindings cannot establish a prior admission.
 
 `state` is `active`, `closing` or `ended`. New fields may be added within a schema version; a field is never
 removed or changed in meaning without incrementing `schema_version`.
@@ -266,9 +269,10 @@ canonicalize an existing directory before constructing a claim path, then retain
 
 `domain::session::service::resume(&store, &Resume, now)` exposes the same guarded operation to library
 callers. `domain::session::Resume` carries `handle`, `source`, `destination`, `source_wrapper` and
-`destination_wrapper`. Its `LinkStore::rebind` port reads the identities and source-claim presence, then
-saves the admitted session, destination binding and claim changes in one transaction. Native and wrapper
-liveness verification belongs to the caller of this API as well.
+`destination_wrapper`. Its `LinkStore::rebind` port reads the identities, source-claim presence and exact
+admission receipt, then saves the admitted session, destination binding, receipt and claim changes in one
+transaction. Launch identities and wrappers are immutable; receipts reference those existing records.
+Native and wrapper liveness verification belongs to the caller of this API as well.
 
 ## Development
 

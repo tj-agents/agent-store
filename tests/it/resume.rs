@@ -3,7 +3,9 @@ use std::process::Stdio;
 use agent_store::domain::session::{Handle, LaunchId, Resume, Wrapper, service};
 use agent_store::sqlite::Store;
 use chrono::{DateTime, Utc};
-use sea_orm::sqlx::{Connection, SqliteConnection, query, sqlite::SqliteConnectOptions};
+use sea_orm::sqlx::{
+    Connection, SqliteConnection, query, query_scalar, sqlite::SqliteConnectOptions,
+};
 use serde_json::{Value, json};
 
 use crate::Fixture;
@@ -316,6 +318,99 @@ fn resume_without_claims_adopts_absent_destination_metadata_and_retries() {
 }
 
 #[test]
+fn ordinary_registration_without_claims_cannot_masquerade_as_a_resume_retry() {
+    for host in ["claude", "codex"] {
+        for difference in ["none", "cwd", "parent"] {
+            let fixture = Fixture::new();
+            let handle = format!("{host}:owner");
+            launch(&fixture, "source", host);
+            register(&fixture, &handle, Some("source"));
+            let destination = input(
+                &fixture,
+                &json!({
+                    "command": "launch", "launch_id": "destination", "host": host,
+                    "title": "continued", "cwd": fixture.path("destination"),
+                    "wrapper_pid": 202, "wrapper_started_at": NEW_TIME,
+                    "parent": if difference == "parent" { None } else { Some("claude:parent") },
+                }),
+            )["launch"]
+                .clone();
+            let registered = input(
+                &fixture,
+                &json!({
+                    "command": "register", "session": handle, "launch_id": "destination",
+                    "cwd": if difference == "cwd" {
+                        json!(fixture.path("elsewhere"))
+                    } else {
+                        destination["cwd"].clone()
+                    },
+                }),
+            )["session"]
+                .clone();
+            for field in ["cwd", "worktree", "terminal", "wrapper", "title", "parent"] {
+                if field == difference {
+                    assert_ne!(registered[field], destination[field], "{host}/{difference}");
+                } else {
+                    assert_eq!(
+                        registered[field], destination[field],
+                        "{host}/{difference}/{field}"
+                    );
+                }
+            }
+            assert_eq!(claims(&fixture, &handle, Some("source")), json!([]));
+            let before = snapshot(&fixture);
+            let run = fixture.run_input(&request(&handle, "destination").to_string());
+            assert_eq!(run.code, 4, "{host}/{difference}: {}", run.json);
+            assert_eq!(run.json["error"]["code"], "conflict");
+            assert_eq!(snapshot(&fixture), before, "{host}/{difference}");
+        }
+    }
+}
+
+#[test]
+fn resume_receipts_apply_only_to_the_exact_session_source_and_destination() {
+    for difference in ["session", "source", "destination"] {
+        let fixture = seed();
+        input(&fixture, &request("codex:owner", "destination"));
+        let mut retry = request("codex:owner", "destination");
+        match difference {
+            "session" => {
+                register(&fixture, "codex:owner", Some("source"));
+                fixture.ok(&["end", "--session", "codex:owner"]);
+                register(&fixture, "codex:foreign", Some("source"));
+                register(&fixture, "codex:owner", Some("destination"));
+                fixture.ok(&["end", "--session", "codex:owner"]);
+                register(&fixture, "codex:foreign", Some("destination"));
+                retry["session"] = json!("codex:foreign");
+            }
+            "source" => {
+                input(
+                    &fixture,
+                    &json!({
+                        "command": "launch", "launch_id": "other-source", "host": "codex",
+                        "title": "other", "cwd": fixture.path("other"),
+                        "wrapper_pid": 101, "wrapper_started_at": OLD_TIME,
+                    }),
+                );
+                register(&fixture, "codex:owner", Some("other-source"));
+                register(&fixture, "codex:owner", Some("destination"));
+                retry["from_launch_id"] = json!("other-source");
+            }
+            "destination" => {
+                launch(&fixture, "other-destination", "codex");
+                register(&fixture, "codex:owner", Some("other-destination"));
+                retry["launch_id"] = json!("other-destination");
+            }
+            _ => unreachable!(),
+        }
+        let before = snapshot(&fixture);
+        let run = fixture.run_input(&retry.to_string());
+        assert_eq!(run.code, 4, "{difference}: {}", run.json);
+        assert_eq!(snapshot(&fixture), before, "{difference}");
+    }
+}
+
+#[test]
 fn resume_rejects_closing_foreign_and_changed_bindings_without_writes() {
     for case in [
         "source-closing",
@@ -506,11 +601,13 @@ async fn claim_update_failure_rolls_back_session_destination_links_and_all_claim
     assert_eq!(run.code, 5, "{}", run.json);
     assert_eq!(run.json["error"]["code"], "storage");
     assert_eq!(snapshot(&fixture), before);
+    assert_eq!(receipt_count(&mut connection).await, 0);
     query("DROP TRIGGER refuse_transfer")
         .execute(&mut connection)
         .await
         .unwrap();
     input(&fixture, &request("codex:owner", "destination"));
+    assert_eq!(receipt_count(&mut connection).await, 1);
     assert_eq!(
         claims(&fixture, "codex:owner", Some("destination"))
             .as_array()
@@ -518,4 +615,94 @@ async fn claim_update_failure_rolls_back_session_destination_links_and_all_claim
             .len(),
         2
     );
+}
+
+async fn receipt_count(connection: &mut SqliteConnection) -> i64 {
+    query_scalar("SELECT COUNT(*) FROM session_resumes")
+        .fetch_one(connection)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn receipt_migration_preserves_existing_records_without_inventing_admissions() {
+    let fixture = seed();
+    let before = snapshot(&fixture);
+    let options = SqliteConnectOptions::new()
+        .filename(fixture.database())
+        .foreign_keys(true);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    // Removing only the new table and migration entry restores the prior, populated schema.
+    query("DROP TABLE session_resumes")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    query("DELETE FROM seaql_migrations WHERE version = 'm20261118_000001_record_resumes'")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(snapshot(&fixture), before);
+    assert_eq!(receipt_count(&mut connection).await, 0);
+    let resumed = input(&fixture, &request("codex:owner", "destination"));
+    assert_eq!(receipt_count(&mut connection).await, 1);
+    assert_eq!(
+        input(&fixture, &request("codex:owner", "destination")),
+        resumed
+    );
+    assert_eq!(receipt_count(&mut connection).await, 1);
+    let owner: i64 = query_scalar("SELECT id FROM sessions WHERE native_id = 'owner'")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    for (session, source, destination) in [
+        (owner, "source", "destination"),
+        (-1, "source", "destination"),
+        (owner, "missing", "destination"),
+        (owner, "source", "missing"),
+    ] {
+        assert!(
+            query("INSERT INTO session_resumes VALUES (?, ?, ?)")
+                .bind(session)
+                .bind(source)
+                .bind(destination)
+                .execute(&mut connection)
+                .await
+                .is_err(),
+            "receipt must be unique and reference existing records"
+        );
+    }
+    assert_eq!(receipt_count(&mut connection).await, 1);
+}
+
+#[tokio::test]
+async fn failed_receipt_migration_leaves_existing_data_and_migration_history_unchanged() {
+    let fixture = seed();
+    let options = SqliteConnectOptions::new().filename(fixture.database());
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    // The pre-existing table makes CREATE TABLE fail before admission can begin.
+    query("DELETE FROM seaql_migrations WHERE version = 'm20261118_000001_record_resumes'")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    let run = fixture.run_input(&request("codex:owner", "destination").to_string());
+    assert_eq!(run.code, 5, "{}", run.json);
+    let recorded: i64 = query_scalar(
+        "SELECT COUNT(*) FROM seaql_migrations WHERE version = 'm20261118_000001_record_resumes'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(recorded, 0);
+    assert_eq!(receipt_count(&mut connection).await, 0);
+    let binding: String = query_scalar("SELECT launch_id FROM sessions WHERE native_id = 'owner'")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(binding, "source");
+    let claims: i64 =
+        query_scalar("SELECT COUNT(*) FROM worktree_ownerships WHERE launch_id = 'source'")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+    assert_eq!(claims, 2);
 }

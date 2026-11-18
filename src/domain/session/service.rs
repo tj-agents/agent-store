@@ -85,6 +85,8 @@ pub enum ResumeError {
     Closing,
     #[error("resume source still owns worktrees after destination binding")]
     RemainingClaims,
+    #[error("this session was not admitted by resume from the source to the destination")]
+    NotAdmitted,
     #[error(transparent)]
     Store(StoreError),
 }
@@ -191,7 +193,7 @@ pub async fn resume(
             &request.handle,
             &request.source,
             &request.destination,
-            |source, destination, session, source_has_claims| {
+            |source, destination, session, source_has_claims, admitted| {
                 let source = source.ok_or_else(|| {
                     ResumeError::UnknownLaunch(UnknownLaunch(request.source.clone()))
                 })?;
@@ -227,6 +229,9 @@ pub async fn resume(
                     }
                     if source_has_claims {
                         return Err(ResumeError::RemainingClaims);
+                    }
+                    if !admitted {
+                        return Err(ResumeError::NotAdmitted);
                     }
                     return Ok(session);
                 }
