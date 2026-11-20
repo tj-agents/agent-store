@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::process::Stdio;
 
 use agent_store::domain::session::{Handle, LaunchId, Resume, Wrapper, service};
@@ -116,6 +117,104 @@ fn snapshot(fixture: &Fixture) -> Value {
         "source": claims(fixture, "codex:owner", Some("source")),
         "destination": claims(fixture, "codex:owner", Some("destination")),
     })
+}
+
+#[test]
+fn guarded_registration_retries_same_owner_and_refuses_a_different_launch() {
+    let fixture = seed();
+    let before = snapshot(&fixture);
+    let register = |launch| {
+        fixture.run_input(
+            &json!({
+                "command": "register", "session": "codex:owner", "cwd": "original",
+                "launch_id": launch, "require_unowned": true,
+            })
+            .to_string(),
+        )
+    };
+    let conflict = register("destination");
+    assert_eq!(
+        conflict.json["error"]["code"], "conflict",
+        "{}",
+        conflict.json
+    );
+    assert_eq!(snapshot(&fixture), before);
+    assert_eq!(register("source").code, 0);
+    assert_eq!(
+        claims(&fixture, "codex:owner", Some("source")),
+        before["source"]
+    );
+}
+
+#[test]
+fn competing_guarded_registrations_bind_exactly_one_launch() {
+    let fixture = Fixture::new();
+    let handle = "codex:new";
+    let register = || {
+        fixture
+            .command(&["--input", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    launch(&fixture, "source", "codex");
+    launch(&fixture, "destination", "codex");
+    let mut first = register();
+    let mut second = register();
+    for (child, id) in [(&mut first, "source"), (&mut second, "destination")] {
+        let request = json!({
+            "command": "register", "session": handle, "cwd": "original",
+            "launch_id": id, "require_unowned": true,
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(request.to_string().as_bytes())
+            .unwrap();
+    }
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    let mut codes = [first.status.code().unwrap(), second.status.code().unwrap()];
+    codes.sort_unstable();
+    assert_eq!(codes, [0, 4]);
+    let (winner, loser) = if first.status.success() {
+        ("source", "destination")
+    } else {
+        ("destination", "source")
+    };
+    assert_eq!(
+        fixture.ok(&["show", handle])["session"]["launch_id"],
+        winner
+    );
+    assert_eq!(
+        fixture.ok(&["show", "--launch-id", winner])["launch"]["session"],
+        handle
+    );
+    assert!(fixture.ok(&["show", "--launch-id", loser])["launch"]["session"].is_null());
+}
+
+#[test]
+fn resume_moves_open_marker_once_with_the_owner() {
+    let fixture = seed();
+    fixture.ok(&["set-open", "--launch-id", "source", "--open", "true"]);
+    let resume = arguments("codex:owner", "destination");
+    fixture.ok(&resume);
+    assert_eq!(
+        fixture.ok(&["show", "--launch-id", "source"])["launch"]["open"],
+        false
+    );
+    assert_eq!(
+        fixture.ok(&["show", "--launch-id", "destination"])["launch"]["open"],
+        true
+    );
+    fixture.ok(&["set-open", "--launch-id", "destination", "--open", "false"]);
+    fixture.ok(&resume);
+    assert_eq!(
+        fixture.ok(&["show", "--launch-id", "destination"])["launch"]["open"],
+        false
+    );
 }
 
 #[test]

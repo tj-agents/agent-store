@@ -62,7 +62,7 @@ pub enum RegisterError {
         expected: Host,
         actual: Host,
     },
-    #[error("launch {} is already bound to {session}", .launch.as_str())]
+    #[error("registration conflicts with an existing binding for launch {} and session {session}", .launch.as_str())]
     AlreadyBound { launch: LaunchId, session: Handle },
     #[error(transparent)]
     Store(StoreError),
@@ -134,6 +134,26 @@ pub async fn register_launched(
     launch: &LaunchId,
     now: DateTime<Utc>,
 ) -> Result<Session, RegisterError> {
+    bind_registration(store, registration, launch, now, false).await
+}
+
+/// Binds an unowned session or repeats registration for the same launch.
+pub async fn register_unowned(
+    store: &impl LinkStore,
+    registration: Registration,
+    launch: &LaunchId,
+    now: DateTime<Utc>,
+) -> Result<Session, RegisterError> {
+    bind_registration(store, registration, launch, now, true).await
+}
+
+async fn bind_registration(
+    store: &impl LinkStore,
+    registration: Registration,
+    launch: &LaunchId,
+    now: DateTime<Utc>,
+    require_unowned: bool,
+) -> Result<Session, RegisterError> {
     let handle = registration.handle.clone();
     store
         .bind(launch, &handle, |found, existing, owner| {
@@ -144,6 +164,15 @@ pub async fn register_launched(
                     launch: launch.clone(),
                     expected: found.host,
                     actual: handle.host().clone(),
+                });
+            }
+            if require_unowned
+                && let Some(current) = existing.as_ref().and_then(Session::launch)
+                && current != launch
+            {
+                return Err(RegisterError::AlreadyBound {
+                    session: handle.clone(),
+                    launch: current.clone(),
                 });
             }
             if let Some(bound) = &found.session

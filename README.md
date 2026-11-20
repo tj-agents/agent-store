@@ -101,8 +101,10 @@ A session is addressed by its handle, `host:session-id`, for example `claude:0f3
 
 A **launch** is a terminal tab started for an agent before the agent's host assigns a session id. The
 process that owns the tab records it under an id of its own choosing and hands that id to the agent; the
-agent's session then registers with `--launch-id` and inherits the launch's title, parent, terminal, wrapper
-and work item. A wrapper stops its agent when its launch or the bound session is `closing`. A launch's `open`
+agent's session then registers with `--launch-id U --require-unowned` and inherits the launch's title, parent,
+terminal, wrapper and work item. The same launch can retry registration. A replacement launch uses
+[guarded resume](#guarded-resume) to take over a stopped session. A wrapper stops its agent when its launch
+or the bound session is `closing`. A launch's `open`
 records whether its tab is open, as its wrapper last reported; it starts `false`.
 
 An active owner keeps its launch: another native session receives a conflict without changing either
@@ -112,8 +114,8 @@ the old session's history remains unchanged. These checks and concurrent first b
 | Command | Result `data` |
 |---|---|
 | `launch --launch-id U --host H --title T --cwd DIR --wrapper-pid PID --wrapper-started-at TIME [--worktree DIR] [--item REF] [--terminal-kind K [--terminal-id ID]] [--parent H]` | `{launch}`. A launch id is recorded once. |
-| `register --session H --cwd DIR [--worktree DIR] [--terminal-kind K [--terminal-id ID]] [--wrapper-pid PID --wrapper-started-at TIME] [--title T] [--parent H] [--launch-id U] [--started-at TIME]` | `{session}`. Relative paths resolve against the current directory. Re-registering a session (a resume) updates where it runs and keeps its links, and its title and parent unless new ones are given; an ended session becomes active again, and a pending close request stays. With `--launch-id`, what the other arguments leave unset comes from that launch, the launch's item is linked as `owner` unless already linked, and the launch shows this session. |
-| `resume --session H --from-launch-id OLD --launch-id NEW --from-wrapper-pid OLD_PID --from-wrapper-started-at OLD_TIME --wrapper-pid NEW_PID --wrapper-started-at NEW_TIME` | `{session}`. Compare the recorded source and destination identities, rebind the session and move all of its source worktree claims in one transaction. See [guarded resume](#guarded-resume). |
+| `register --session H --cwd DIR [--worktree DIR] [--terminal-kind K [--terminal-id ID]] [--wrapper-pid PID --wrapper-started-at TIME] [--title T] [--parent H] [--launch-id U [--require-unowned]] [--started-at TIME]` | `{session}`. Relative paths resolve against the current directory. Re-registering updates where the session runs and preserves links and pending close requests. With `--launch-id`, the session inherits unspecified fields and links the launch's item as `owner` unless already linked. With `--require-unowned`, a different owner causes a conflict. |
+| `resume --session H --from-launch-id OLD --launch-id NEW --from-wrapper-pid OLD_PID --from-wrapper-started-at OLD_TIME --wrapper-pid NEW_PID --wrapper-started-at NEW_TIME` | `{session}`. Compare the recorded identities and move the session, claims and open marker in one transaction. See [guarded resume](#guarded-resume). |
 | `link --session H --item REF [--role owner]` | `{session}`. Linking again changes only the role. |
 | `end --session H [--reason closed]` or `end --launch-id U [--reason closed]` | `{session}` or `{launch}` |
 | `mark-closing --item REF`, `--session H` or `--launch-id U` | `{sessions, launches}`: those now `closing`. `--item` reaches every session linked to the item and every launch for it. |

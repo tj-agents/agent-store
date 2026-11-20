@@ -326,7 +326,8 @@ impl LinkStore for Store {
         + Send,
     ) -> Result<Result<Session, E>, StoreError> {
         let txn = self.write().await?;
-        let source_launch = match find_launch_row(&txn, source).await? {
+        let source_row = find_launch_row(&txn, source).await?;
+        let source_launch = match source_row.clone() {
             Some(row) => Some(to_launch(&txn, row).await?),
             None => None,
         };
@@ -378,12 +379,23 @@ impl LinkStore for Store {
         launch::Entity::update(launch::ActiveModel {
             id: Set(destination_row.id),
             session_id: Set(Some(id)),
+            open: if admitted { NotSet } else { Set(true) },
             ..Default::default()
         })
         .exec(&txn)
         .await
         .map_err(unavailable)?;
         if !admitted {
+            let source_row =
+                source_row.ok_or_else(|| corrupt("resume has no source launch".into()))?;
+            launch::Entity::update(launch::ActiveModel {
+                id: Set(source_row.id),
+                open: Set(false),
+                ..Default::default()
+            })
+            .exec(&txn)
+            .await
+            .map_err(unavailable)?;
             session_resume::Entity::insert(session_resume::ActiveModel {
                 session_id: Set(id),
                 source_launch_id: Set(source.as_str().to_owned()),

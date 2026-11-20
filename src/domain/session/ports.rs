@@ -104,7 +104,9 @@ pub trait LinkStore {
     /// Reads both launches, the session, whether it has source claims and whether this exact
     /// session/source/destination resume was admitted, under one write lock. Saves the validated
     /// session, binds the destination, records admission and moves only this session's source claims
-    /// without changing their paths or timestamps. Any failure leaves all records unchanged.
+    /// without changing their paths or timestamps. The first admission closes the source's open
+    /// marker and opens the destination's marker in the same transaction. A retry preserves marker
+    /// changes made after admission. Any failure leaves all records unchanged.
     fn rebind<E: Send>(
         &self,
         handle: &Handle,
