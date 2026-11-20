@@ -136,6 +136,10 @@ enum Command {
         /// Bind to this launch, inheriting what these arguments leave unset and linking its work item.
         #[arg(long)]
         launch_id: Option<String>,
+        /// Require the session to be unowned or already bound to this launch.
+        #[arg(long, requires = "launch_id")]
+        #[serde(default)]
+        require_unowned: bool,
         #[arg(long)]
         title: Option<String>,
         /// The session that started this one, as `host:session-id`.
@@ -502,6 +506,7 @@ async fn dispatch(
             wrapper_pid,
             wrapper_started_at,
             launch_id,
+            require_unowned,
             title,
             parent,
             started_at,
@@ -526,23 +531,28 @@ async fn dispatch(
                 launch: None,
                 started_at: started_at.unwrap_or(now),
             };
-            let session = match launch_id {
-                Some(launch_id) => service::register_launched(
-                    store,
-                    registration,
-                    &parse_launch_id(&launch_id)?,
-                    now,
-                )
-                .await
-                .map_err(|e| match e {
+            let session = if let Some(launch_id) = launch_id {
+                let launch = parse_launch_id(&launch_id)?;
+                let result = if require_unowned {
+                    service::register_unowned(store, registration, &launch, now).await
+                } else {
+                    service::register_launched(store, registration, &launch, now).await
+                };
+                result.map_err(|e| match e {
                     RegisterError::UnknownLaunch(e) => Failure::new(Code::NotFound, &e),
                     RegisterError::HostMismatch { .. } => Failure::new(Code::InvalidInput, &e),
-                    RegisterError::AlreadyBound { .. } => Failure::new(Code::Conflict, &e),
+                    RegisterError::AlreadyBound { .. } | RegisterError::SessionOwned { .. } => {
+                        Failure::new(Code::Conflict, &e)
+                    }
                     RegisterError::Store(e) => storage(&e),
-                })?,
-                None => service::register(store, registration)
+                })?
+            } else {
+                if require_unowned {
+                    return Err(Failure::invalid("require_unowned requires launch_id"));
+                }
+                service::register(store, registration)
                     .await
-                    .map_err(|e| storage(&e))?,
+                    .map_err(|e| storage(&e))?
             };
             Ok(json!({ "session": SessionView::from(&session) }))
         }

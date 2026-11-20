@@ -119,6 +119,33 @@ fn snapshot(fixture: &Fixture) -> Value {
 }
 
 #[test]
+fn guarded_registration_retries_same_owner_and_refuses_a_different_launch() {
+    let fixture = seed();
+    let before = snapshot(&fixture);
+    let register = |launch| {
+        fixture.run_input(
+            &json!({
+                "command": "register", "session": "codex:owner", "cwd": "original",
+                "launch_id": launch, "require_unowned": true,
+            })
+            .to_string(),
+        )
+    };
+    let conflict = register("destination");
+    assert_eq!(
+        conflict.json["error"]["code"], "conflict",
+        "{}",
+        conflict.json
+    );
+    assert_eq!(snapshot(&fixture), before);
+    assert_eq!(register("source").code, 0);
+    assert_eq!(
+        claims(&fixture, "codex:owner", Some("source")),
+        before["source"]
+    );
+}
+
+#[test]
 fn resume_moves_only_the_exact_source_claims_and_preserves_history_and_links() {
     for host in ["claude", "codex"] {
         let fixture = Fixture::new();
