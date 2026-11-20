@@ -541,9 +541,7 @@ async fn dispatch(
                 result.map_err(|e| match e {
                     RegisterError::UnknownLaunch(e) => Failure::new(Code::NotFound, &e),
                     RegisterError::HostMismatch { .. } => Failure::new(Code::InvalidInput, &e),
-                    RegisterError::AlreadyBound { .. } | RegisterError::SessionOwned { .. } => {
-                        Failure::new(Code::Conflict, &e)
-                    }
+                    RegisterError::AlreadyBound { .. } => Failure::new(Code::Conflict, &e),
                     RegisterError::Store(e) => storage(&e),
                 })?
             } else {

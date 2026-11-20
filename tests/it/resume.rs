@@ -146,6 +146,51 @@ fn guarded_registration_retries_same_owner_and_refuses_a_different_launch() {
 }
 
 #[test]
+fn competing_guarded_registrations_bind_exactly_one_launch() {
+    let fixture = Fixture::new();
+    let handle = "codex:new";
+    let register = |id| {
+        fixture
+            .command(&[
+                "register",
+                "--session",
+                handle,
+                "--cwd",
+                "original",
+                "--launch-id",
+                id,
+                "--require-unowned",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    launch(&fixture, "source", "codex");
+    launch(&fixture, "destination", "codex");
+    let first = register("source");
+    let second = register("destination");
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    let mut codes = [first.status.code().unwrap(), second.status.code().unwrap()];
+    codes.sort_unstable();
+    assert_eq!(codes, [0, 4]);
+    let (winner, loser) = if first.status.success() {
+        ("source", "destination")
+    } else {
+        ("destination", "source")
+    };
+    assert_eq!(
+        fixture.ok(&["show", handle])["session"]["launch_id"],
+        winner
+    );
+    assert_eq!(
+        fixture.ok(&["show", "--launch-id", winner])["launch"]["session"],
+        handle
+    );
+    assert!(fixture.ok(&["show", "--launch-id", loser])["launch"]["session"].is_null());
+}
+
+#[test]
 fn resume_moves_only_the_exact_source_claims_and_preserves_history_and_links() {
     for host in ["claude", "codex"] {
         let fixture = Fixture::new();

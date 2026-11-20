@@ -64,8 +64,6 @@ pub enum RegisterError {
     },
     #[error("launch {} is already bound to {session}", .launch.as_str())]
     AlreadyBound { launch: LaunchId, session: Handle },
-    #[error("session {session} already belongs to launch {}; use guarded resume", .launch.as_str())]
-    SessionOwned { session: Handle, launch: LaunchId },
     #[error(transparent)]
     Store(StoreError),
 }
@@ -172,7 +170,7 @@ async fn bind_registration(
                 && let Some(current) = existing.as_ref().and_then(Session::launch)
                 && current != launch
             {
-                return Err(RegisterError::SessionOwned {
+                return Err(RegisterError::AlreadyBound {
                     session: handle.clone(),
                     launch: current.clone(),
                 });
