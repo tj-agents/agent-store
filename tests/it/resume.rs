@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::process::Stdio;
 
 use agent_store::domain::session::{Handle, LaunchId, Resume, Wrapper, service};
@@ -149,26 +150,30 @@ fn guarded_registration_retries_same_owner_and_refuses_a_different_launch() {
 fn competing_guarded_registrations_bind_exactly_one_launch() {
     let fixture = Fixture::new();
     let handle = "codex:new";
-    let register = |id| {
+    let register = || {
         fixture
-            .command(&[
-                "register",
-                "--session",
-                handle,
-                "--cwd",
-                "original",
-                "--launch-id",
-                id,
-                "--require-unowned",
-            ])
+            .command(&["--input", "-"])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap()
     };
     launch(&fixture, "source", "codex");
     launch(&fixture, "destination", "codex");
-    let first = register("source");
-    let second = register("destination");
+    let mut first = register();
+    let mut second = register();
+    for (child, id) in [(&mut first, "source"), (&mut second, "destination")] {
+        let request = json!({
+            "command": "register", "session": handle, "cwd": "original",
+            "launch_id": id, "require_unowned": true,
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(request.to_string().as_bytes())
+            .unwrap();
+    }
     let first = first.wait_with_output().unwrap();
     let second = second.wait_with_output().unwrap();
     let mut codes = [first.status.code().unwrap(), second.status.code().unwrap()];
@@ -188,6 +193,28 @@ fn competing_guarded_registrations_bind_exactly_one_launch() {
         handle
     );
     assert!(fixture.ok(&["show", "--launch-id", loser])["launch"]["session"].is_null());
+}
+
+#[test]
+fn resume_moves_open_marker_once_with_the_owner() {
+    let fixture = seed();
+    fixture.ok(&["set-open", "--launch-id", "source", "--open", "true"]);
+    let resume = arguments("codex:owner", "destination");
+    fixture.ok(&resume);
+    assert_eq!(
+        fixture.ok(&["show", "--launch-id", "source"])["launch"]["open"],
+        false
+    );
+    assert_eq!(
+        fixture.ok(&["show", "--launch-id", "destination"])["launch"]["open"],
+        true
+    );
+    fixture.ok(&["set-open", "--launch-id", "destination", "--open", "false"]);
+    fixture.ok(&resume);
+    assert_eq!(
+        fixture.ok(&["show", "--launch-id", "destination"])["launch"]["open"],
+        false
+    );
 }
 
 #[test]

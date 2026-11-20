@@ -62,7 +62,7 @@ pub enum RegisterError {
         expected: Host,
         actual: Host,
     },
-    #[error("launch {} is already bound to {session}", .launch.as_str())]
+    #[error("registration conflicts with an existing binding for launch {} and session {session}", .launch.as_str())]
     AlreadyBound { launch: LaunchId, session: Handle },
     #[error(transparent)]
     Store(StoreError),
